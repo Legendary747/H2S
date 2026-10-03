@@ -72,10 +72,16 @@ test('normal Cloudflare widgets are ignored; real challenge headings are detecte
   doc.title = 'Just a moment...';
   assert.equal(core.challenge(doc),true);
 });
-test('first scan suppresses existing listings; later newly eligible listings create notifications', () => {
+test('first scan queues matches; successful notifications stay deduplicated across scans, reloads and days', async () => {
   const item = sample();
   let state = update(null,[item]);
+  assert.equal(state.items[item.url].pending.reason,'首次发现符合条件');
+  let sends = 0;
+  await core.deliverPending(state,async () => {sends++;},() => {},() => true,() => 200);
+  state = update(JSON.parse(JSON.stringify(state)),[item],86400100);
   assert.equal(state.items[item.url].pending,null);
+  await core.deliverPending(state,async () => {sends++;},() => {});
+  assert.equal(sends,1);
   state = update(state,[item,sample({url:item.url.replace('example','new')})]);
   assert.equal(Object.values(state.items).filter(x => x.pending).length,1);
   state = update(null,[sample({rent:1100})]);
@@ -84,6 +90,33 @@ test('first scan suppresses existing listings; later newly eligible listings cre
   state = update(null,[sample({status:'Available in lottery'})]);
   state = update(state,[item]);
   assert.equal(state.items[item.url].pending.reason,'变为可直接预订');
+});
+test('upgrade sends never-notified old baseline matches without repeating prior successful deliveries', async () => {
+  const neverSent = sample();
+  const delivered = sample({url:sample().url.replace('example','delivered')});
+  const previous = {version:1,scope:'scope',initialized:true,sent:1,items:{
+    [neverSent.url]:{...neverSent,eligible:true,missing:0,lastSeen:10,pending:null},
+    [delivered.url]:{...delivered,eligible:true,missing:0,lastSeen:10,pending:null,lastNotified:20}
+  }};
+  let state = update(previous,[neverSent,delivered]);
+  assert.equal(state.items[neverSent.url].pending.reason,'首次通知');
+  assert.equal(state.items[delivered.url].pending,null);
+  const sent = [];
+  await core.deliverPending(state,async item => {sent.push(item.url);},() => {});
+  assert.deepEqual(sent,[neverSent.url]);
+  state = update(JSON.parse(JSON.stringify(state)),[neverSent,delivered]);
+  assert.ok(Object.values(state.items).every(item => !item.pending));
+});
+test('explicit silent baseline remains silent later but still notifies new listings and price drops', () => {
+  const item = sample();
+  let state = core.reconcile(null,[item],'scope','Den Haag',1000,100,{silentBaseline:true}).state;
+  assert.equal(state.items[item.url].pending,null);
+  assert.equal(state.items[item.url].lastNotified,undefined);
+  state = update(JSON.parse(JSON.stringify(state)),[item]);
+  assert.equal(state.items[item.url].pending,null);
+  state = update(state,[sample({rent:850}),sample({url:item.url.replace('example','new')})]);
+  assert.equal(state.items[item.url].pending.reason,'主租金下降');
+  assert.equal(Object.values(state.items).filter(item => item.pending).length,2);
 });
 test('notifications include exactly the five cities, recognize Den Haag, and preserve budget/status filters', () => {
   const rows = [...targets,'Den Haag','Amsterdam'].map((city,i) => sample({city,title:'Example, '+city,url:sample().url.replace('example','city-'+i)}));
@@ -96,9 +129,10 @@ test('notifications include exactly the five cities, recognize Den Haag, and pre
   assert.equal(Object.values(state.items).find(x => x.rent===1001).pending,null);
   assert.equal(Object.values(state.items).find(x => x.status==='Available in lottery').pending,null);
 });
-test('two complete missing sweeps trigger reappearance, one transient disappearance does not', () => {
+test('two complete missing sweeps trigger reappearance, one transient disappearance does not', async () => {
   const item = sample();
   let state = update(null,[item]);
+  await core.deliverPending(state,async () => {},() => {});
   state = update(state,[]);
   state = update(state,[item]);
   assert.equal(state.items[item.url].pending,null);
@@ -108,10 +142,13 @@ test('two complete missing sweeps trigger reappearance, one transient disappeara
 });
 test('notification failures stay pending across scans and storage round trips', async () => {
   const item = sample();
-  let state = update(update(null,[]),[item]);
+  let state = update(null,[item]);
+  const detectedAt = state.items[item.url].pending.detectedAt;
   await assert.rejects(core.deliverPending(state,async () => {throw Error('network failure');},() => {}));
   assert.ok(state.items[item.url].pending);
+  assert.equal(state.items[item.url].lastNotified,undefined);
   state = update(JSON.parse(JSON.stringify(state)),[item]);
+  assert.equal(state.items[item.url].pending.detectedAt,detectedAt);
   let sends = 0;
   await core.deliverPending(state,async () => {sends++;},() => {},() => true,() => 200);
   assert.equal(sends,1);
@@ -120,7 +157,7 @@ test('notification failures stay pending across scans and storage round trips', 
   await core.deliverPending(state,async () => {sends++;},() => {});
   assert.equal(sends,1);
 });
-test('scope change resets baseline; pause guard prevents sending', async () => {
+test('scope change queues current matches with fresh tracking; pause guard prevents sending', async () => {
   const item = sample();
   let state = update(update(null,[]),[item]);
   let sends = 0;
@@ -128,7 +165,7 @@ test('scope change resets baseline; pause guard prevents sending', async () => {
   assert.equal(sends,0);
   assert.ok(state.items[item.url].pending);
   state = core.reconcile(state,[item],'changed filters','Den Haag',1000,200).state;
-  assert.equal(state.items[item.url].pending,null);
+  assert.equal(state.items[item.url].pending.reason,'首次发现符合条件');
 });
 test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () => {
   assert.equal(core.withinHours(new Date('2026-07-01T05:00:00Z')),true);
@@ -139,7 +176,7 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
 
 // Offline runtime harness: real DOM events/selectors, virtual clock and mocked GM APIs.
 // No network requests or page scripts from the uploaded HTML are executed.
-function harness({brokenSecondPage = false, blocked = false, selectedFilter = false, resetFails = false, initialCity = 'The Hague', outsideFirst = false} = {}) {
+function harness({brokenSecondPage = false, blocked = false, selectedFilter = false, resetFails = false, initialCity = 'The Hague', outsideFirst = false, configured = false, startTime = '2026-10-03T10:00:00Z'} = {}) {
   const {document,window} = parseHTML(fixture);
   const card = document.querySelectorAll('.residence_block')[6].cloneNode(true);
   card.querySelector('.price_text').innerHTML = '€900.00<span class="excl">per month excl.*</span>';
@@ -177,9 +214,14 @@ function harness({brokenSecondPage = false, blocked = false, selectedFilter = fa
   const storage = new Map();
   const menus = new Map();
   const intervals = [];
-  let clock = Date.parse('2026-10-03T10:00:00Z');
+  let clock = Date.parse(startTime);
   let networkCalls = 0;
+  const messages = [];
   const prefix = 'h2s_single_city_den_haag:';
+  if (configured) {
+    storage.set(prefix+'token','123456:offline_test_token_not_real');
+    storage.set(prefix+'chatId','12345');
+  }
   class Clock extends Date { constructor(...args) {super(...(args.length ? args : [clock]));} static now() {return clock;} }
   const sandbox = {document,window,Date:Clock,Intl,URL,console,crypto:require('node:crypto').webcrypto,
     location:{pathname:'/residences',origin:'https://www.holland2stay.com',reload() {}},
@@ -191,12 +233,17 @@ function harness({brokenSecondPage = false, blocked = false, selectedFilter = fa
     GM_getValue:(key,fallback) => storage.has(key) ? structuredClone(storage.get(key)) : fallback,
     GM_setValue:(key,value) => storage.set(key,structuredClone(value)),
     GM_registerMenuCommand:(label,fn) => menus.set(label,fn),
-    GM_xmlhttpRequest() {networkCalls++;throw Error('Unexpected real notification');}};
+    GM_xmlhttpRequest(request) {
+      networkCalls++;
+      if (!configured) throw Error('Unexpected notification');
+      messages.push(JSON.parse(request.data));
+      queueMicrotask(() => request.onload({status:200,responseText:JSON.stringify({ok:true,result:{message_id:messages.length}})}));
+    }};
   vm.runInNewContext(source,sandbox,{filename:'h2s-monitor.user.js'});
-  return {document,storage,menus,intervals,visited,prefix,second,get resets(){return resets;},get networkCalls(){return networkCalls;}};
+  return {document,storage,menus,intervals,visited,prefix,second,messages,get resets(){return resets;},get networkCalls(){return networkCalls;}};
 }
 async function drain() {for (let i = 0; i < 50; i++) await new Promise(resolve => setImmediate(resolve));}
-test('full userscript runtime traverses the actual pagination controls and stores a complete baseline', async () => {
+test('full runtime scans all pages and queues initial matches while Telegram is unconfigured', async () => {
   const app = harness();
   await drain();
   const state = app.storage.get(app.prefix + 'state');
@@ -204,10 +251,50 @@ test('full userscript runtime traverses the actual pagination controls and store
   assert.equal(Object.keys(state.items).length,2);
   assert.deepEqual(app.visited,[1,2]);
   assert.equal(app.networkCalls,0);
-  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/已建立完整基线/);
+  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/首次完整扫描完成.*待发通知 2 条/);
   const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
   check();await drain();
   assert.deepEqual(app.visited,[1,2,1,2]);
+});
+test('configured runtime sends first-scan matches automatically and repeated scans do not resend', async () => {
+  const app = harness({configured:true});
+  await drain();
+  assert.equal(app.messages.length,2);
+  assert.ok(app.messages.every(message => message.chat_id==='12345' && message.text.includes('首次发现符合条件')));
+  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/本轮已通知 2 条/);
+  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
+  check();await drain();
+  assert.equal(app.messages.length,2);
+  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/本轮已通知 0 条/);
+});
+test('nighttime automatic scans pause; manual first scan sends matches without clearing history', async () => {
+  const app = harness({configured:true,startTime:'2026-10-03T22:00:00Z'});
+  await drain();
+  assert.equal(app.storage.has(app.prefix+'state'),false);
+  assert.equal(app.messages.length,0);
+  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
+  check();await drain();
+  assert.equal(app.messages.length,2);
+  check();await drain();
+  assert.equal(app.messages.length,2);
+});
+test('silent-reset and force-resend menus each apply once and preserve later deduplication', async () => {
+  const app = harness({configured:true});
+  await drain();
+  assert.equal(app.messages.length,2);
+  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
+  app.menus.get('清除历史并重建基线（不通知现有房源）')();await drain();
+  check();await drain();
+  assert.equal(app.messages.length,2);
+  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/已按选择建立静默基线/);
+  check();await drain();
+  assert.equal(app.messages.length,2);
+  app.menus.get('重新通知当前符合条件的房源（强制重发）')();await drain();
+  check();await drain();
+  assert.equal(app.messages.length,4);
+  assert.ok(app.messages.slice(2).every(message => message.text.includes('手动重新通知')));
+  check();await drain();
+  assert.equal(app.messages.length,4);
 });
 test('full runtime rejects a page that never finishes rendering without creating an empty baseline', async () => {
   const app = harness({brokenSecondPage:true});

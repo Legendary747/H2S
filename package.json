@@ -1,6 +1,6 @@
 {
   "name": "h2s-browser-monitor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Holland2Stay all-city DOM scanner with five-city Telegram notifications",
   "scripts": {"test": "node --test tests/*.test.cjs", "check": "node --check h2s-monitor.user.js"},

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.1.0
+// @version      1.2.0
 // @description  Scan all H2S cities and locally notify for The Hague, Rijswijk, Rotterdam, Leiden and Zoetermeer.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -154,22 +154,27 @@
     if (new Set(listings.map(item => item.url)).size !== total || listings.length !== total) throw Error('分页结果不完整或重复；本轮不更新历史');
   }
   function freshState(scope) { return {version: VERSION, scope, initialized: false, items: {}, sent: 0}; }
-  function reconcile(previous, listings, scope, target, maxRent, now) {
+  function reconcile(previous, listings, scope, target, maxRent, now, {silentBaseline = false} = {}) {
     const state = previous?.version === VERSION && previous.scope === scope ? JSON.parse(JSON.stringify(previous)) : freshState(scope);
     const baseline = !state.initialized;
+    const skipInitial = baseline && silentBaseline;
     const observed = new Set(listings.map(item => item.url));
     for (const item of listings) {
       const old = state.items[item.url];
       const eligible = matchesCity(item.city, target) && item.rent <= maxRent && directStatus(item.status);
       let reason = null;
-      if (!baseline && eligible) {
-        if (!old) reason = '新房源';
+      if (eligible && !skipInitial) {
+        if (!old) reason = baseline ? '首次发现符合条件' : '新房源';
         else if (old.missing >= 2) reason = '重新出现，可直接预订';
         else if (!old.eligible) reason = old.rent > maxRent ? '降价进入预算' : '变为可直接预订';
         else if (item.rent < old.rent) reason = '主租金下降';
+        // Older versions silently recorded the first scan. Notify those never sent,
+        // while preserving successful deliveries and explicit silent-reset choices.
+        else if (old.lastNotified == null && !old.initialNoticeSkipped && !old.pending) reason = '首次通知';
       }
       state.items[item.url] = {...old, ...item, eligible, missing: 0, lastSeen: now,
-        pending: baseline || !eligible ? null : reason ? {reason, detectedAt: now} : old?.pending || null};
+        ...(skipInitial && eligible ? {initialNoticeSkipped: true} : {}),
+        pending: skipInitial || !eligible ? null : reason ? {reason, detectedAt: now} : old?.pending || null};
     }
     for (const [url, item] of Object.entries(state.items)) {
       if (!observed.has(url)) { item.missing = (item.missing || 0) + 1; item.pending = null; }
@@ -383,12 +388,15 @@
       assertAllowed(scope, manual);
       const oldState = get('state', null);
       const targetListings = listings.filter(item => matchesCity(item.city, TARGET_CITIES));
-      const {state, baseline} = reconcile(oldState, targetListings, scope, TARGET_CITIES, MAX_RENT, Date.now());
-      if (get('notifyExisting', false)) {
+      const notifyExisting = get('notifyExisting', false);
+      const silentBaseline = get('silentBaseline', false) && !notifyExisting;
+      const {state, baseline} = reconcile(oldState, targetListings, scope, TARGET_CITIES, MAX_RENT, Date.now(), {silentBaseline});
+      if (notifyExisting) {
         for (const item of Object.values(state.items)) if (item.eligible && !item.missing) item.pending = {reason: '手动重新通知', detectedAt: Date.now()};
-        set('notifyExisting', false);
       }
       set('state', state);
+      set('notifyExisting', false);
+      set('silentBaseline', false);
       if (configured() && Date.now() >= nextTelegramAttempt) {
         const sentBefore = state.sent || 0;
         try {
@@ -408,7 +416,9 @@
         }
       }
       const pending = Object.values(state.items).filter(item => item.pending).length;
-      setMessage(baseline ? '已建立完整基线；现有房源默认不通知' : '完整扫描完成' + (pending ? '；待发通知 ' + pending + ' 条' : ''));
+      const completion = baseline && silentBaseline ? '已按选择建立静默基线；现有房源不通知'
+        : (baseline ? '首次完整扫描完成' : '完整扫描完成') + '；本轮已通知 ' + stats.sent + ' 条';
+      setMessage(completion + (pending ? '；待发通知 ' + pending + ' 条' : ''));
       if (withinHours()) scheduleRefresh();
       else nextRefresh = 0;
     } catch (error) {
@@ -477,13 +487,13 @@
   register('清除历史并重建基线（不通知现有房源）', () => {
     requireIdle();
     if (!confirm('清除监控历史，并把下次完整扫描作为新基线？现有房源不会通知。')) return;
-    set('state', null); set('notifyExisting', false); dirty = true; retryAt = 0;
+    set('state', null); set('notifyExisting', false); set('silentBaseline', true); dirty = true; retryAt = 0;
   });
-  register('清除通知历史并重新通知当前符合条件的房源', () => {
+  register('重新通知当前符合条件的房源（强制重发）', () => {
     requireIdle();
     if (!configured()) throw Error('请先配置 Telegram');
     if (!confirm('下一次完整扫描后，向已配置的 Telegram 重新发送当前所有符合条件的房源？')) return;
-    set('notifyExisting', true); dirty = true; retryAt = 0;
+    set('notifyExisting', true); set('silentBaseline', false); dirty = true; retryAt = 0;
   });
   register('查看历史', () => {
     const state = get('state', null);
