@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.2.0
-// @description  Scan all H2S cities and locally notify for The Hague, Rijswijk, Rotterdam, Leiden and Zoetermeer.
+// @version      1.3.0
+// @description  Scan H2S by ascending rent, stop above budget, and notify for five allowed cities or one manually selected city.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
 // @grant        GM_getValue
@@ -17,10 +17,10 @@
 (() => {
   'use strict';
 
-  // City options change with availability. Never depend on them to find future listings.
+  // Without a City filter, scan all cities by ascending price and locally match this list.
+  // With one City selected, scan only that city if it belongs to this list.
   const TARGET_CITIES = ['The Hague', 'Rijswijk', 'Rotterdam', 'Leiden', 'Zoetermeer'];
-  const MAX_RENT = 1000;
-  const AUTO_RESET_FILTERS = true;
+  const MAX_RENT = 1500;
   // Keep the original @name and prefix so an in-place update preserves Telegram configuration.
   const STORAGE_PREFIX = 'h2s_single_city_den_haag';
   const TIME_ZONE = 'Europe/Amsterdam';
@@ -31,6 +31,7 @@
   const MAX_SETTLE_MS = 30000;
   const MAX_PAGES = 50;
   const VERSION = 1;
+  const HISTORY_VERSION = 2;
 
   const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
   const text = element => clean(element?.textContent);
@@ -131,11 +132,56 @@
   }
   function filterState(doc) {
     const root = doc.querySelector('.selected_filter [aria-label="Current Filters"]');
-    if (!root) return {ok: false, unknown: true, reason: '尚未加载已应用筛选区域'};
-    const inputs = [...doc.querySelectorAll('[aria-label^="Filter products by "] input[type="checkbox"], [aria-label^="Filter products by "] input[type="radio"]')];
-    const selected = inputs.some(input => input.checked);
-    const ok = root.children.length === 0 && !text(root) && !selected;
-    return {ok, unknown: false, reason: ok ? '' : '页面存在筛选条件；需要恢复全部城市列表'};
+    if (!root) return {ok: false, city: '', cities: [], wanted: false, reason: '等待官网城市筛选加载'};
+    const nameOf = value => clean(value).replace(/\s*[×✕]\s*$/, '').replace(/\s+(?:remove|clear)(?:\s+filter)?$/i, '')
+      .replace(/^city(?:\s*[:：-]\s*|\s+)/i, '').replace(/\s*\(\s*\d+\s*\)\s*$/, '').trim();
+    const selected = input => input.checked === true || (typeof input.checked !== 'boolean' && input.hasAttribute('checked'));
+    const cityRoot = doc.querySelector('[aria-label="Filter products by City"]');
+    const inputs = [...(cityRoot?.querySelectorAll('input[type="checkbox"],input[type="radio"]') || [])];
+    const optionName = input => nameOf(input.getAttribute('title') || input.getAttribute('aria-label') ||
+      text(input.closest('label')) || (input.id && text([...doc.querySelectorAll('label')].find(label => label.htmlFor === input.id))) ||
+      (/^[a-z]/i.test(input.value || '') && input.value !== 'on' ? input.value : ''));
+    const checked = inputs.filter(selected);
+    const checkedNames = checked.map(optionName).filter(Boolean);
+    const options = new Set(inputs.map(optionName).filter(Boolean).map(cityKey));
+    const chips = [...root.children].map(node => {
+      const copy = node.cloneNode(true);
+      copy.querySelectorAll('svg,[aria-hidden="true"]').forEach(el => el.remove());
+      copy.querySelectorAll('button,a,[role="button"]').forEach(el => {
+        if (/^(?:[×✕x]|remove|clear)?$/i.test(text(el))) el.remove();
+      });
+      return nameOf(text(copy));
+    }).filter(Boolean);
+    const recognized = chips.filter(name => matchesCity(name, TARGET_CITIES) || options.has(cityKey(name)));
+    const names = [...new Map((checkedNames.length ? checkedNames : recognized.length ? recognized : chips)
+      .map(name => [cityKey(name), name])).values()];
+    const city = names.length === 1 ? names[0] : '';
+    const wanted = names.length > 0 && names.every(name => matchesCity(name, TARGET_CITIES));
+    const otherInputs = [...doc.querySelectorAll('[aria-label^="Filter products by "] input[type="checkbox"], [aria-label^="Filter products by "] input[type="radio"]')]
+      .some(input => selected(input) && !cityRoot?.contains(input));
+    const otherChips = chips.some(name => !names.some(city => cityKey(city) === cityKey(name)));
+    let reason = '';
+    if (checked.length !== checkedNames.length) reason = '无法识别选中的城市名称；请展开 City 筛选';
+    else if (!names.length && !otherInputs && !text(root)) return {ok: true, city: '', cities: [], wanted: true, allCities: true, reason: ''};
+    else if (!names.length) reason = '请手动清除其他网页筛选，或只保留一个 City';
+    else if (names.length !== 1) reason = '一次只扫描一个城市；请只保留一个 City 选项';
+    else if (!wanted) reason = '当前城市不在目标五城中，不开始扫描';
+    else if (otherInputs || otherChips || (text(root) && !chips.length)) reason = '请只保留当前 City，手动清除其他网页筛选';
+    return {ok: !reason, city, cities: names, wanted, reason};
+  }
+  function isAscendingPrice(value) {
+    const label = clean(value);
+    return /\b(?:price|rent|prijs)\b/i.test(label) &&
+      /\blow(?:est)?\s*(?:to|[-–→])\s*high(?:est)?\b|\basc(?:ending)?\b|laag.*hoog|oplopend|↑/i.test(label) &&
+      !/\bhigh(?:est)?\s*(?:to|[-–→])\s*low(?:est)?\b|\bdesc(?:ending)?\b/i.test(label);
+  }
+  function priceSortState(doc) {
+    const root = doc.querySelector('[data-cy="ProductSort-root"]');
+    const button = root?.querySelector('[data-cy="ProductSort-sortButton"]');
+    const chosen = root?.querySelector('[aria-selected="true"],[aria-checked="true"],input:checked');
+    const ok = root?.getAttribute('aria-busy') !== 'true' && (isAscendingPrice(text(button)) ||
+      (chosen && isAscendingPrice(text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label'))));
+    return {ok: Boolean(ok), button, root};
   }
   function challenge(doc) {
     // A normal embedded Turnstile widget or the word "Cloudflare" is NOT a challenge page.
@@ -150,10 +196,37 @@
     const hour = Number(new Intl.DateTimeFormat('en-GB', {timeZone: TIME_ZONE, hour: '2-digit', hourCycle: 'h23'}).format(date));
     return hour >= START_HOUR && hour < END_HOUR;
   }
-  function validateSweep(listings, total) {
+  function validateSweep(listings, total, city) {
     if (new Set(listings.map(item => item.url)).size !== total || listings.length !== total) throw Error('分页结果不完整或重复；本轮不更新历史');
+    if (city && listings.some(item => !matchesCity(item.city, city))) throw Error('房源城市与所选城市不一致；本轮不更新历史');
   }
+  function validateBudgetSweep(listings, total, maxRent, city, ended) {
+    if (new Set(listings.map(item => item.url)).size !== listings.length || listings.length > total) throw Error('分页重复或数量不一致；本轮不更新历史');
+    if (city && listings.some(item => !matchesCity(item.city, city))) throw Error('房源城市与所选城市不一致；本轮不更新历史');
+    if (listings.some((item, index) => index && item.rent < listings[index - 1].rent)) throw Error('价格没有按升序排列；请确认 Price: low to high');
+    const cutoff = listings.some(item => item.rent > maxRent);
+    if (!cutoff && (!ended || listings.length !== total)) throw Error('预算内分页尚未完成；本轮不更新历史');
+    return {cutoff};
+  }
+  const cityScope = city => 'selected-city-v1:' + cityKey(city);
   function freshState(scope) { return {version: VERSION, scope, initialized: false, items: {}, sent: 0}; }
+  function historyFrom(previous) {
+    if (previous?.version === HISTORY_VERSION && previous.cities) return JSON.parse(JSON.stringify(previous));
+    const history = {version: HISTORY_VERSION, cities: {}, sent: previous?.sent || 0};
+    // Import v1.0–v1.2 records without resending successes or dropping unsent listings.
+    if (previous?.version === VERSION && previous.items) {
+      for (const old of Object.values(previous.items)) {
+        if (!old.city) continue;
+        const key = cityKey(old.city);
+        const state = history.cities[key] ||= freshState(cityScope(key));
+        state.initialized = Boolean(previous.initialized);
+        state.lastCompleteScan = previous.lastCompleteScan;
+        state.items[old.url] = JSON.parse(JSON.stringify(old));
+        if (old.lastNotified != null) state.sent++;
+      }
+    }
+    return history;
+  }
   function reconcile(previous, listings, scope, target, maxRent, now, {silentBaseline = false} = {}) {
     const state = previous?.version === VERSION && previous.scope === scope ? JSON.parse(JSON.stringify(previous)) : freshState(scope);
     const baseline = !state.initialized;
@@ -193,7 +266,7 @@
       item.lastNotified = now();
       item.pending = null;
       state.sent = (state.sent || 0) + 1;
-      save(state);
+      save(state, item);
       sent++;
     }
     return sent;
@@ -202,7 +275,8 @@
   // The userscript is also directly importable by the offline regression tests.
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {cityKey, cityKeys, matchesCity, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
-      filterState, challenge, withinHours, validateSweep, freshState, reconcile, deliverPending};
+      filterState, isAscendingPrice, priceSortState, challenge, withinHours, validateSweep, validateBudgetSweep,
+      cityScope, historyFrom, freshState, reconcile, deliverPending};
     return;
   }
   if (!/^\/residences\/?$/.test(location.pathname)) return; // Never run on a booking/detail page.
@@ -213,6 +287,8 @@
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const formatTime = value => value ? new Intl.DateTimeFormat('zh-CN', {timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'}).format(new Date(value)) : '—';
   let scanRunning = false;
+  let deliveryRunning = false;
+  let deliveryContext = null;
   let isLeader = false;
   let nextRefresh = 0;
   let retryAt = 0;
@@ -222,7 +298,7 @@
   let retryNoticeAt = 0;
   let daytime = withinHours();
   let maintenanceUntil = 0;
-  const stats = {message: '正在启动', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
+  const stats = {message: '正在启动', phase: '未开始', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
   const panel = document.createElement('aside');
   panel.id = 'h2s-monitor-panel';
   Object.assign(panel.style, {position: 'fixed', right: '16px', bottom: '84px', zIndex: '2147483646', padding: '14px 16px',
@@ -230,54 +306,76 @@
     border: '1px solid #75c8d2', borderRadius: '12px', boxShadow: '0 6px 28px #0005', whiteSpace: 'pre-wrap'});
   document.body.append(panel);
   function configured() { return Boolean(get('token', '') && get('chatId', '')); }
+  const readHistory = () => historyFrom(get('state', null));
+  const targetsFor = filters => filters.allCities ? TARGET_CITIES : filters.city ? [filters.city] : [];
+  const scopeFor = filters => JSON.stringify(['price-asc-v1', filters.allCities ? '*' : cityKey(filters.city), MAX_RENT]);
+  const queuedItems = (history, filters) => Object.values(history.cities).flatMap(state => Object.values(state.items))
+    .filter(item => item.pending && item.eligible && !item.missing && item.rent <= MAX_RENT && matchesCity(item.city, targetsFor(filters)));
   function render() {
-    const state = get('state', null);
-    panel.textContent = ['H2S · 五城市监控 · 主租金 ≤ €' + MAX_RENT, CITY_LABEL,
-      (isLeader ? '' : '待机：') + stats.message,
-      '全站扫描 ' + stats.scanned + ' 套 · 五城符合 ' + stats.matched + ' 套 · 第 ' + stats.pages + ' 页',
-      '本轮通知 ' + stats.sent + ' · 累计 ' + (state?.sent || 0),
+    const filters = filterState(document);
+    const history = readHistory();
+    const sameScope = filters.ok && stats.scope === scopeFor(filters);
+    const previous = filters.ok ? history.scans?.[scopeFor(filters)] : null;
+    const pending = filters.ok ? queuedItems(history, filters).length : 0;
+    const others = Object.values(history.cities).flatMap(state => Object.values(state.items)).filter(item => item.pending && item.eligible && !item.missing).length - pending;
+    panel.textContent = ['H2S · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
+      '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
+      '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
+      '允许扫描：' + (filters.ok ? '是' : '否；' + filters.reason),
+      '价格排序：' + (priceSortState(document).ok ? '从低到高' : '尚未确认升序'),
+      '扫描状态：' + (isLeader ? stats.phase : '待机，另一个标签页正在监控'), stats.message,
+      '已读 ' + (sameScope ? stats.scanned : previous?.inspected || 0) + ' 套 · 符合 ' + (sameScope ? stats.matched : previous?.matched || 0) + ' 套 · 第 ' + (sameScope ? stats.pages : previous?.pages || 0) + ' 页',
+      '本轮已发 ' + (sameScope ? stats.sent : 0) + ' · 当前范围待发 ' + pending + ' · 累计 ' + history.sent,
+      ...(others > 0 ? ['其他城市 / 范围待复查 ' + others + ' 条'] : []),
       'Telegram：' + (configured() ? stats.telegram === '未配置' ? '已配置' : stats.telegram : '未配置（菜单设置）'),
-      '上次完整扫描 ' + formatTime(state?.lastCompleteScan),
-      '下次刷新 ' + formatTime(nextRefresh), '自动运行 07:00–23:00 荷兰时间'].join('\n');
+      '上次扫描终点：' + (previous ? previous.cutoff ? '超出预算，已停止翻页' : '已到最后一页' : '尚未完成'),
+      '上次完成预算内扫描 ' + formatTime(previous?.completedAt),
+      '下次刷新 ' + formatTime(filters.ok && lastScope === scopeFor(filters) ? nextRefresh : 0),
+      '自动运行 ' + String(START_HOUR).padStart(2, '0') + ':00–' + String(END_HOUR).padStart(2, '0') + ':00 荷兰时间'].join('\n');
   }
   function setMessage(message) { stats.message = message; render(); }
+  function setStatus(phase, message) { stats.phase = phase; setMessage(message); }
   function scheduleRefresh() { nextRefresh = Date.now() + (REFRESH_MINUTES[0] + Math.random() * (REFRESH_MINUTES[1] - REFRESH_MINUTES[0])) * 60000; }
   function filtersFingerprint() {
-    // Availability-derived city options must not change the baseline scope.
-    return JSON.stringify(['all-cities-v1', cityKeys(TARGET_CITIES), MAX_RENT]);
+    return scopeFor(filterState(document));
   }
-  function assertRunning(manual) {
+  function assertRunning(manual, sending = false) {
     if (!isLeader || get('paused', false)) throw Error('监控已暂停');
     if (challenge(document)) throw Error('检测到验证页面，已停止操作');
     if (!manual && !withinHours()) throw Error('已进入夜间暂停时段');
-    if (Date.now() < maintenanceUntil) throw Error('检测到手动操作，等待 30 秒后继续');
+    if (!sending && Date.now() < maintenanceUntil) throw Error('检测到手动操作，等待 30 秒后继续扫描');
   }
-  function assertAllowed(scope, manual) {
-    assertRunning(manual);
+  function assertScope(scope, manual, sending = false) {
+    assertRunning(manual, sending);
     const filters = filterState(document);
     if (!filters.ok) throw Error(filters.reason);
     if (filtersFingerprint() !== scope) throw Error('筛选条件已改变；本轮已取消');
   }
-  async function ensureUnfiltered(manual) {
+  function assertAllowed(scope, manual) {
+    assertScope(scope, manual);
+    if (!priceSortState(document).ok) throw Error('价格排序发生变化；请使用 Price: low to high');
+  }
+  async function ensurePriceSort(scope, manual) {
+    if (priceSortState(document).ok) return;
+    const initial = priceSortState(document);
+    if (!initial.button) throw Error('未找到官网 Sort 控件，请手动选择价格从低到高');
+    setStatus('准备排序', '正在选择 Price: low to high');
+    initial.button.click();
     const start = Date.now();
-    let resetClicked = false;
+    let chosen = false;
     while (Date.now() - start < MAX_SETTLE_MS) {
-      assertRunning(manual);
-      const filters = filterState(document);
-      if (filters.ok) return;
-      if (!filters.unknown && !resetClicked) {
-        if (!AUTO_RESET_FILTERS) throw Error('请点击官网 Reset 清除筛选，保持全部城市');
-        const reset = document.querySelector('.residenceFilter .reset_text');
-        if (!reset || !/^reset$/i.test(text(reset))) throw Error('检测到筛选，但未找到 Reset；请手动清除网页筛选');
-        if (Date.now() - get('lastFilterReset', 0) < 30000) throw Error('刚重置后仍有筛选，请手动点击 Reset；暂不重复刷新');
-        setMessage('正在清除网页筛选，恢复全部城市列表');
-        set('lastFilterReset', Date.now());
-        reset.click();
-        resetClicked = true;
+      assertScope(scope, manual);
+      const sorting = priceSortState(document);
+      if (sorting.ok) return;
+      if (!chosen) {
+        const candidates = [...(sorting.root?.querySelectorAll('button,a,[role="option"],[role="menuitem"],label') || []),
+          ...document.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]')];
+        const option = candidates.find(node => node !== sorting.button && isAscendingPrice(text(node)));
+        if (option) { option.click(); chosen = true; }
       }
       await sleep(500);
     }
-    throw Error('未能确认全部城市列表；请手动点击 Reset 后重试');
+    throw Error('未能确认升序排序；请在官网 Sort 中手动选择 Price: low to high 后立即检查');
   }
   function fingerprint(result) {
     return JSON.stringify([result.total, result.page.current, result.page.last, result.listings.map(item => [item.url, item.rent, item.status])]);
@@ -289,6 +387,9 @@
       assertAllowed(scope, manual);
       try {
         const result = parsePage(document);
+        const selectedCity = filterState(document).city;
+        if (selectedCity && result.listings.some(item => !matchesCity(item.city, selectedCity))) throw Error('等待列表切换到所选城市');
+        if (result.listings.some((item, index) => index && item.rent < result.listings[index - 1].rent)) throw Error('等待价格升序生效');
         const signature = fingerprint(result);
         const correctPage = !expectedPage || result.page.current === expectedPage;
         const changed = oldSignature === null || signature !== oldSignature;
@@ -336,7 +437,7 @@
   }
   async function notifyBlock() {
     nextRefresh = 0;
-    setMessage('遇到验证/访问受阻，请在当前页手动处理；自动刷新已停');
+    setStatus('验证暂停', '遇到验证/访问受阻，请在当前页手动处理；自动刷新已停');
     const incident = get('incident', null) || {started: Date.now(), sent: false};
     set('incident', incident);
     if (incident.sent || !configured() || Date.now() < retryNoticeAt) return;
@@ -347,23 +448,68 @@
       set('incident', incident);
     } catch { stats.telegram = '验证提醒发送失败，稍后重试'; render(); }
   }
+  async function flushPending(context) {
+    if (deliveryRunning || !configured() || Date.now() < nextTelegramAttempt) return;
+    const filters = filterState(document);
+    const history = readHistory();
+    const queue = queuedItems(history, filters);
+    if (!queue.length) { deliveryContext = null; return; }
+    const state = {items: Object.fromEntries(queue.map(item => [item.url, item])), sent: history.sent};
+    deliveryRunning = true;
+    setStatus('通知发送中（扫描已完成）', '逐条发送已确认房源；当前范围待发 ' + queue.length + ' 条');
+    try {
+      await deliverPending(state, async item => {
+        await sleep(1100);
+        // Pagination clicks do not invalidate an already verified snapshot. Changing
+        // the selected city, pausing, or encountering a challenge still stops delivery.
+        assertScope(context.scope, context.manual, true);
+        try { await sendText(listingMessage(item)); }
+        catch (error) { error.telegramFailure = true; throw error; }
+        stats.telegram = '发送成功';
+        nextTelegramAttempt = 0;
+      }, (value, item) => {
+        const latest = readHistory();
+        const city = latest.cities[cityKey(item.city)];
+        city.items[item.url] = item;
+        city.sent = (city.sent || 0) + 1;
+        latest.sent++;
+        set('state', latest);
+        stats.sent++;
+        render();
+      }, () => { assertScope(context.scope, context.manual, true); return true; });
+      deliveryContext = null;
+      setStatus('本轮已完成', '预算内扫描完成；本轮已发 ' + stats.sent + ' 条');
+    } catch (error) {
+      if (error.telegramFailure) {
+        nextTelegramAttempt = Date.now() + Math.max(60, error.retryAfter || 60) * 1000;
+        stats.telegram = error.message;
+        setStatus('通知等待重试（扫描已完成）', '待发记录已保留；最早重试 ' + formatTime(nextTelegramAttempt));
+      } else {
+        deliveryContext = null;
+        setStatus('通知已暂停（扫描已完成）', error.message + '；待发记录已保留');
+      }
+    } finally { deliveryRunning = false; render(); }
+  }
   async function runScan(manual = false) {
-    if (scanRunning || !isLeader || get('paused', false)) return;
-    if (!manual && !withinHours()) { nextRefresh = 0; setMessage('夜间暂停；菜单可手动立即检查'); return; }
+    if (scanRunning || deliveryRunning || !isLeader || get('paused', false)) return;
+    if (challenge(document)) { await notifyBlock(); return; }
+    const filters = filterState(document);
+    if (!filters.ok) { nextRefresh = 0; setStatus('未开始', filters.reason); return; }
+    if (!manual && !withinHours()) { nextRefresh = 0; setStatus('夜间暂停', '菜单可手动立即检查'); return; }
     scanRunning = true;
     dirty = false;
-    stats.sent = 0;
-    let scope;
+    deliveryContext = null;
+    const scope = scopeFor(filters);
+    const targets = targetsFor(filters);
+    Object.assign(stats, {scope, sent: 0, scanned: 0, matched: 0, pages: 0});
+    lastScope = scope;
     try {
-      if (challenge(document)) { await notifyBlock(); return; }
-      await ensureUnfiltered(manual);
-      scope = filtersFingerprint();
-      lastScope = scope;
-      assertAllowed(scope, manual);
-      setMessage('等待全部城市列表稳定，准备扫描全部分页');
+      assertScope(scope, manual);
+      await ensurePriceSort(scope, manual);
+      setStatus('已开始，等待列表稳定', '按价格升序扫描，遇到主租金 > €' + MAX_RENT + ' 后停止翻页');
       let result = await stablePage(scope, manual);
       if (result.page.current !== 1) {
-        if (!result.page.first) throw Error('找不到第 1 页，无法进行完整扫描');
+        if (!result.page.first) throw Error('找不到第 1 页，无法确认预算内房源完整');
         const old = fingerprint(result);
         result.page.first.click();
         result = await stablePage(scope, manual, 1, old);
@@ -373,88 +519,91 @@
       for (let n = 1; n <= MAX_PAGES; n++) {
         assertAllowed(scope, manual);
         if (result.total !== total || result.page.current !== n) throw Error('分页期间结果总数或页码变化；本轮不更新历史');
+        if (listings.length && result.listings.length && result.listings[0].rent < listings[listings.length - 1].rent) throw Error('跨页价格未按升序排列；本轮不更新历史');
         listings.push(...result.listings);
         stats.scanned = listings.length;
-        stats.matched = listings.filter(item => matchesCity(item.city, TARGET_CITIES) && item.rent <= MAX_RENT && directStatus(item.status)).length;
+        stats.matched = listings.filter(item => matchesCity(item.city, targets) && item.rent <= MAX_RENT && directStatus(item.status)).length;
         stats.pages = n;
-        setMessage('扫描第 ' + n + ' 页，共 ' + total + ' 套');
-        if (!result.page.next) break;
+        setStatus('扫描中', '正在读取第 ' + n + ' 页；当前列表共 ' + total + ' 套');
+        if (result.listings.some(item => item.rent > MAX_RENT) || !result.page.next) break;
         if (n === MAX_PAGES) throw Error('超过分页上限；本轮不更新历史');
         const old = fingerprint(result);
         result.page.next.click();
         result = await stablePage(scope, manual, n + 1, old);
       }
-      validateSweep(listings, total);
+      const {cutoff} = validateBudgetSweep(listings, total, MAX_RENT, filters.city, !result.page.next);
       assertAllowed(scope, manual);
-      const oldState = get('state', null);
-      const targetListings = listings.filter(item => matchesCity(item.city, TARGET_CITIES));
-      const notifyExisting = get('notifyExisting', false);
-      const silentBaseline = get('silentBaseline', false) && !notifyExisting;
-      const {state, baseline} = reconcile(oldState, targetListings, scope, TARGET_CITIES, MAX_RENT, Date.now(), {silentBaseline});
-      if (notifyExisting) {
-        for (const item of Object.values(state.items)) if (item.eligible && !item.missing) item.pending = {reason: '手动重新通知', detectedAt: Date.now()};
-      }
-      set('state', state);
-      set('notifyExisting', false);
-      set('silentBaseline', false);
-      if (configured() && Date.now() >= nextTelegramAttempt) {
-        const sentBefore = state.sent || 0;
-        try {
-          await deliverPending(state, async item => {
-            await sleep(1100);
-            assertAllowed(scope, manual);
-            await sendText(listingMessage(item));
-            stats.telegram = '发送成功';
-          }, value => set('state', value), () => {
-            try { assertAllowed(scope, manual); return true; } catch { return false; }
-          });
-        } catch (error) {
-          nextTelegramAttempt = Date.now() + Math.max(60, error.retryAfter || 60) * 1000;
-          stats.telegram = error.message;
-        } finally {
-          stats.sent = (state.sent || 0) - sentBefore;
+      const history = readHistory();
+      const requested = name => get(name, false) === true || get(name, false) === scope;
+      const notifyExisting = requested('notifyExisting');
+      const silentBaseline = requested('silentBaseline') && !notifyExisting;
+      for (const city of targets) {
+        const key = cityKey(city);
+        const previous = history.cities[key];
+        const rows = listings.filter(item => matchesCity(item.city, city));
+        const {state} = reconcile(previous, rows, cityScope(city), city, MAX_RENT, Date.now(), {silentBaseline});
+        if (notifyExisting) {
+          for (const item of Object.values(state.items)) if (item.eligible && !item.missing) item.pending = {reason: '手动重新通知', detectedAt: Date.now()};
         }
+        history.cities[key] = state;
       }
-      const pending = Object.values(state.items).filter(item => item.pending).length;
-      const completion = baseline && silentBaseline ? '已按选择建立静默基线；现有房源不通知'
-        : (baseline ? '首次完整扫描完成' : '完整扫描完成') + '；本轮已通知 ' + stats.sent + ' 条';
-      setMessage(completion + (pending ? '；待发通知 ' + pending + ' 条' : ''));
+      history.scans ||= {};
+      history.scans[scope] = {completedAt: Date.now(), inspected: listings.length, matched: stats.matched, pages: stats.pages, total, cutoff};
+      set('state', history);
+      if (notifyExisting) set('notifyExisting', false);
+      if (silentBaseline) set('silentBaseline', false);
+      const completion = silentBaseline ? '已按选择建立静默记录；现有房源不通知'
+        : cutoff ? '已到超预算位置，停止翻页；预算内扫描完成' : '已读到末页；预算内扫描完成';
+      setStatus('扫描已完成', completion);
+      if (queuedItems(history, filters).length) {
+        deliveryContext = {scope, manual, expiresAt: Date.now() + 15 * 60000};
+        await flushPending(deliveryContext);
+      }
       if (withinHours()) scheduleRefresh();
       else nextRefresh = 0;
     } catch (error) {
-      setMessage(error.message);
+      setStatus('扫描未完成', error.message);
       if (challenge(document)) await notifyBlock();
-      retryAt = Date.now() + 60000;
+      retryAt = Math.max(Date.now() + 60000, maintenanceUntil);
       dirty = true;
-      // Failed scans cannot suppress existing notifications or initialize the baseline.
-      if (!nextRefresh && scope && withinHours() && !challenge(document)) scheduleRefresh();
-    } finally {
-      scanRunning = false;
-      render();
-    }
+    } finally { scanRunning = false; render(); }
   }
   async function tick() {
-    if (!isLeader || scanRunning) return;
-    if (get('paused', false)) { nextRefresh = 0; setMessage('手动暂停；菜单可恢复'); return; }
+    if (!isLeader || scanRunning || deliveryRunning) return;
+    if (get('paused', false)) { nextRefresh = 0; setStatus('手动暂停', '菜单可恢复'); return; }
     if (challenge(document)) { await notifyBlock(); return; }
     if (get('incident', null)) { set('incident', null); dirty = true; retryAt = 0; }
-    if (!withinHours()) { daytime = false; nextRefresh = 0; setMessage('夜间暂停；菜单可手动立即检查'); return; }
-    if (!filterState(document).ok) { dirty = true; nextRefresh = 0; }
-    if (!daytime) { daytime = true; location.reload(); return; }
-    if (lastScope && filtersFingerprint() !== lastScope) { dirty = true; retryAt = 0; nextRefresh = 0; }
-    // Refresh fresh server-rendered data before starting the next scheduled cycle.
-    if (nextRefresh && Date.now() >= nextRefresh && Date.now() >= maintenanceUntil) { location.reload(); return; }
-    if (dirty && Date.now() >= retryAt && Date.now() >= maintenanceUntil) { await runScan(); return; }
-    if (!nextRefresh) {
-      if (get('state', null)?.lastCompleteScan) { scheduleRefresh(); dirty = true; }
-      else dirty = true;
+    const filters = filterState(document);
+    if (!filters.ok) { deliveryContext = null; dirty = true; nextRefresh = 0; setStatus('未开始', filters.reason); return; }
+    const scope = scopeFor(filters);
+    if (lastScope && scope !== lastScope) { deliveryContext = null; dirty = true; retryAt = 0; nextRefresh = 0; }
+    if (deliveryContext && Date.now() >= deliveryContext.expiresAt) {
+      deliveryContext = null;
+      dirty = true; // Recheck availability before retrying an old snapshot.
     }
+    if (deliveryContext && configured() && (withinHours() || deliveryContext.manual)) {
+      if (Date.now() >= nextTelegramAttempt) await flushPending(deliveryContext);
+      if (deliveryContext) {
+        setStatus('通知等待重试（扫描已完成）', '当前范围待发记录已保留；最早重试 ' + formatTime(nextTelegramAttempt));
+        return;
+      }
+    }
+    if (!withinHours()) { daytime = false; nextRefresh = 0; setStatus('夜间暂停', '菜单可手动立即检查；待发数量保留显示'); return; }
+    if (!daytime) { daytime = true; location.reload(); return; }
+    if (Date.now() < maintenanceUntil) { setStatus('等待手动操作结束', '30 秒观察期结束后继续扫描'); return; }
+    if (nextRefresh && Date.now() >= nextRefresh) { location.reload(); return; }
+    if (dirty && Date.now() >= retryAt) { await runScan(); return; }
     render();
   }
   function safe(callback) { return (...args) => { Promise.resolve().then(() => callback(...args)).catch(error => { setMessage(error.message); }); }; }
   function requireIdle() {
     if (!isLeader) throw Error('请使用正在监控的那个 H2S 标签页');
-    if (scanRunning) throw Error('当前正在扫描，请扫描结束后再操作');
+    if (scanRunning || deliveryRunning) throw Error('当前正在扫描或发送通知，请结束后再操作');
+  }
+  function requireFilters() {
+    const filters = filterState(document);
+    if (!filters.ok) throw Error(filters.reason);
+    return filters;
   }
   function register(label, callback) { GM_registerMenuCommand(label, safe(callback)); }
   register('配置 Telegram Token', () => {
@@ -486,18 +635,24 @@
   register('暂停 / 恢复', () => { set('paused', !get('paused', false)); dirty = true; retryAt = 0; nextRefresh = 0; render(); });
   register('清除历史并重建基线（不通知现有房源）', () => {
     requireIdle();
-    if (!confirm('清除监控历史，并把下次完整扫描作为新基线？现有房源不会通知。')) return;
-    set('state', null); set('notifyExisting', false); set('silentBaseline', true); dirty = true; retryAt = 0;
+    const filters = requireFilters();
+    if (!confirm('清除当前扫描范围的房源历史，并跳过下次预算内扫描中现有房源的通知？')) return;
+    const history = readHistory();
+    for (const city of targetsFor(filters)) history.cities[cityKey(city)] = freshState(cityScope(city));
+    history.scans = {};
+    set('state', history); set('notifyExisting', false); set('silentBaseline', scopeFor(filters));
+    deliveryContext = null; dirty = true; retryAt = 0;
   });
   register('重新通知当前符合条件的房源（强制重发）', () => {
     requireIdle();
+    const filters = requireFilters();
     if (!configured()) throw Error('请先配置 Telegram');
-    if (!confirm('下一次完整扫描后，向已配置的 Telegram 重新发送当前所有符合条件的房源？')) return;
-    set('notifyExisting', true); set('silentBaseline', false); dirty = true; retryAt = 0;
+    if (!confirm('下一次预算内扫描后，重新发送当前扫描范围内所有符合条件的房源？')) return;
+    set('notifyExisting', scopeFor(filters)); set('silentBaseline', false); dirty = true; retryAt = 0;
   });
   register('查看历史', () => {
-    const state = get('state', null);
-    const items = Object.values(state?.items || {}).sort((a, b) => b.lastSeen - a.lastSeen);
+    const history = readHistory();
+    const items = Object.values(history.cities).flatMap(state => Object.values(state.items)).sort((a, b) => b.lastSeen - a.lastSeen);
     alert(items.length ? items.slice(0, 100).map(item => item.title + '\n€' + item.rent + ' · ' + item.status + (item.pending ? ' · 待通知' : '') + '\n' + item.url).join('\n\n') : '暂无完整扫描历史');
   });
   register('测试 Cloudflare 提醒（仅发送测试消息）', async () => {
@@ -508,11 +663,11 @@
   // Observe late cards and filter changes; ignore our own panel and pagination scan mutations.
   let debounce;
   const observer = new MutationObserver(records => {
-    if (scanRunning || !isLeader) return;
+    if (scanRunning || deliveryRunning || !isLeader) return;
     const meaningful = records.some(record => {
       const el = record.target.nodeType === 1 ? record.target : record.target.parentElement;
       return el && !panel.contains(el) && !el.closest?.('#h2s-monitor-panel') &&
-        (el.closest?.('.residence_MainSection,.selected_filter,.total_residence,#filter_accordion') || [...record.addedNodes].some(node => node.nodeType === 1 && node.matches?.('.residence_MainSection,.residence_block')));
+        (el.closest?.('.residence_MainSection,.selected_filter,.total_residence,#filter_accordion,[data-cy="ProductSort-root"]') || [...record.addedNodes].some(node => node.nodeType === 1 && node.matches?.('.residence_MainSection,.residence_block')));
     });
     if (meaningful) {
       clearTimeout(debounce);
@@ -521,12 +676,16 @@
   });
   observer.observe(document.body, {childList: true, subtree: true, characterData: true});
   document.addEventListener('change', event => {
-    if (!scanRunning && event.target.closest?.('#filter_accordion')) { dirty = true; nextRefresh = 0; retryAt = Date.now() + 2000; }
+    if (event.target.closest?.('#filter_accordion,[aria-label^="Filter products by "]')) {
+      dirty = true; nextRefresh = 0; retryAt = Date.now() + 2000;
+      if (event.isTrusted) maintenanceUntil = Date.now() + 30000;
+      render();
+    }
   });
   document.addEventListener('click', event => {
-    if (event.isTrusted && event.target.closest?.('.residence_pagination,#filter_accordion,.selected_filter')) {
+    if (event.isTrusted && event.target.closest?.('.residence_pagination,#filter_accordion,.selected_filter,[data-cy="ProductSort-root"]')) {
       maintenanceUntil = Date.now() + 30000;
-      dirty = true;
+      if (!deliveryRunning) dirty = true;
     }
   });
   render();

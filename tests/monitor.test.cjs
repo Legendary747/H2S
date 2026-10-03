@@ -35,21 +35,52 @@ test('URL normalization removes tracking, rejects unrelated or booking URLs', ()
   assert.equal(core.normalizeUrl('/residences'),null);
   assert.equal(core.normalizeUrl('javascript:alert(1)'),null);
 });
-test('all-city monitoring does not depend on City options, and detects any applied filters', () => {
+test('recognizes global or one allowed city; rejects other cities, multiple cities and extra filters', () => {
   const doc = documentOf();
   assert.equal(core.filterState(doc).ok,true);
+  assert.equal(core.filterState(doc).allCities,true);
   const section = doc.querySelector('[aria-label="Filter products by City"]');
   section.innerHTML = '<label>Rijswijk (4)<input type="checkbox" title="Rijswijk"></label>';
-  assert.equal(core.filterState(doc).ok,true); // The Hague does not even exist as an option.
+  assert.equal(core.filterState(doc).allCities,true);
   section.querySelector('input').checked = true;
-  assert.equal(core.filterState(doc).ok,false);
-  section.remove();
+  assert.equal(core.filterState(doc).city,'Rijswijk');
   assert.equal(core.filterState(doc).ok,true);
+  section.remove();
   const selected = doc.querySelector('[aria-label="Current Filters"]');
+  selected.innerHTML = '<li>City: The Hague <button aria-label="Remove City">×</button></li>';
+  assert.equal(core.filterState(doc).city,'The Hague');
+  assert.equal(core.filterState(doc).ok,true);
+  selected.innerHTML += '<li>Leiden</li>';
+  assert.equal(core.filterState(doc).ok,false);
+  selected.innerHTML = '<li>Amsterdam</li>';
+  assert.equal(core.filterState(doc).city,'Amsterdam');
+  assert.equal(core.filterState(doc).wanted,false);
   selected.innerHTML = '<li>Rent p/month: €0–€900</li>';
   assert.equal(core.filterState(doc).ok,false);
   selected.remove();
-  assert.equal(core.filterState(doc).unknown,true);
+  assert.equal(core.filterState(doc).ok,false);
+});
+test('budget cutoff requires sorted prices, unique URLs, and a complete prefix or complete result', () => {
+  const rows = [900,1500,1501].map((rent,i) => sample({rent,url:sample().url.replace('example','p'+i)}));
+  assert.equal(core.validateBudgetSweep(rows,100,1500,null,false).cutoff,true);
+  assert.throws(() => core.validateBudgetSweep(rows.slice(0,2),100,1500,null,false));
+  assert.equal(core.validateBudgetSweep(rows.slice(0,2),2,1500,null,true).cutoff,false);
+  assert.throws(() => core.validateBudgetSweep([rows[1],rows[0],rows[2]],3,1500,null,true));
+  assert.throws(() => core.validateBudgetSweep([rows[0],rows[0],rows[2]],3,1500,null,true));
+  assert.throws(() => core.validateBudgetSweep(rows,100,1500,'Leiden',false));
+  for (const label of ['Price: Low to High','Price (Ascending)','Prijs: laag naar hoog']) assert.equal(core.isAscendingPrice(label),true);
+  for (const label of ['Price: High to Low','Sort ...','Price']) assert.equal(core.isAscendingPrice(label),false);
+});
+test('migration separates city history and preserves sent markers, pending records and total successes', () => {
+  const a = {...sample(),eligible:true,missing:0,lastNotified:20,pending:null};
+  const b = {...sample({city:'Leiden',url:sample().url.replace('example','leiden')}),eligible:true,missing:0,pending:{reason:'新房源',detectedAt:10}};
+  const history = core.historyFrom({version:1,scope:'old-all-cities',initialized:true,sent:6,items:{[a.url]:a,[b.url]:b}});
+  assert.equal(history.sent,6);
+  assert.equal(history.cities['den haag'].items[a.url].lastNotified,20);
+  assert.ok(history.cities.leiden.items[b.url].pending);
+  const hague = core.reconcile(history.cities['den haag'],[a],core.cityScope('The Hague'),'The Hague',1500,100).state;
+  assert.equal(hague.items[a.url].pending,null);
+  assert.equal(history.cities.leiden.items[b.url].missing,0);
 });
 test('partial, duplicate, loading and malformed pages cannot form a baseline; mixed cities are valid', () => {
   const page = core.parsePage(documentOf());
@@ -174,180 +205,232 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
   assert.equal(core.withinHours(new Date('2026-10-03T21:00:00Z')),false);
 });
 
-// Offline runtime harness: real DOM events/selectors, virtual clock and mocked GM APIs.
-// No network requests or page scripts from the uploaded HTML are executed.
-function harness({brokenSecondPage = false, blocked = false, selectedFilter = false, resetFails = false, initialCity = 'The Hague', outsideFirst = false, configured = false, startTime = '2026-10-03T10:00:00Z'} = {}) {
+// Offline runtime harness: uploaded card markup, simulated site controls, virtual
+// clock, and mocked Telegram responses. No real network requests are made.
+function harness({pages, cityFilter = null, collapsedCity = false, extraFilter = false,
+  sortMode = 'asc', canSort = true, configured = false, blocked = false, brokenPage = 0,
+  startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
+  pages ||= [[sample()], [sample({rent:1000,url:sample().url.replace('example','second')})]];
   const {document,window} = parseHTML(fixture);
-  const card = document.querySelectorAll('.residence_block')[6].cloneNode(true);
-  card.querySelector('.price_text').innerHTML = '€900.00<span class="excl">per month excl.*</span>';
-  card.querySelector('.residence_name').textContent = 'Example 1, ' + (outsideFirst ? 'Amsterdam' : initialCity);
-  const second = card.cloneNode(true);
-  second.querySelector('.residence_name').textContent = 'Example 2, ' + initialCity;
-  second.querySelector('a[href]').href = 'https://www.holland2stay.com/residences/example-2.html';
+  const template = document.querySelectorAll('.residence_block')[6].cloneNode(true);
   const list = document.querySelector('.residence_MainSection');
   const pager = document.querySelector('.residence_pagination');
-  document.querySelector('.total_residence .count').textContent = '2';
-  const city = document.querySelector('[aria-label="Filter products by City"]');
-  city.innerHTML = '<label>Rijswijk<input title="Rijswijk" type="checkbox"></label>';
-  city.querySelector('input').checked = selectedFilter;
-  const currentFilters = document.querySelector('[aria-label="Current Filters"]');
-  if (selectedFilter) currentFilters.innerHTML = '<li>Rijswijk</li>';
-  document.body.insertAdjacentHTML('beforeend','<div class="residenceFilter"><h2 class="filter_TabHeading"><span class="reset_text">Reset</span></h2></div>');
+  const cityRoot = document.querySelector('[aria-label="Filter products by City"]');
+  const filtersRoot = document.querySelector('[aria-label="Current Filters"]');
+  const handlers = new Map();
+  const originalListen = document.addEventListener.bind(document);
+  document.addEventListener = (type, fn, ...args) => {
+    const fns = handlers.get(type) || [];fns.push(fn);handlers.set(type,fns);
+    originalListen(type,fn,...args);
+  };
+  function selectCity(value) {
+    const cities = value === null ? [] : Array.isArray(value) ? value : [value];
+    cityRoot.innerHTML = collapsedCity ? '' : cities.map(city => '<label>'+city+'<input type="checkbox" title="'+city+'"></label>').join('');
+    cityRoot.querySelectorAll('input').forEach(input => {input.checked=true;});
+    filtersRoot.innerHTML = cities.map(city => '<li>City: '+city+' <button>×</button></li>').join('') + (extraFilter ? '<li>Rent: €0–€900</li>' : '');
+  }
+  selectCity(cityFilter);
+  document.querySelector('.total_residence .count').textContent = String(pages.flat().length);
   let resets = 0;
-  document.querySelector('.reset_text').addEventListener('click',() => {
-    resets++;
-    if (!resetFails) {currentFilters.innerHTML='';city.querySelector('input').checked=false;}
+  document.body.insertAdjacentHTML('beforeend','<div class="residenceFilter"><span class="reset_text">Reset</span></div>');
+  document.querySelector('.reset_text').addEventListener('click',() => {resets++;});
+  let sorting = document.querySelector('[data-cy="ProductSort-root"]');
+  if (!sorting) {sorting = document.createElement('div');sorting.setAttribute('data-cy','ProductSort-root');document.body.append(sorting);}
+  sorting.innerHTML = '<button data-cy="ProductSort-sortButton">'+(sortMode==='asc' ? 'Price: Low to High' : sortMode==='desc' ? 'Price: High to Low' : 'Sort ...')+'</button>';
+  let sortClicks = 0;
+  sorting.querySelector('button').addEventListener('click',() => {
+    sortClicks++;
+    if (!canSort || sorting.querySelector('.price-option')) return;
+    const option = document.createElement('button');option.className='price-option';option.textContent='Price: Low to High';
+    option.addEventListener('click',() => {sorting.querySelector('[data-cy="ProductSort-sortButton"]').textContent='Price: Low to High';option.remove();showPage(1);});
+    sorting.append(option);
   });
   const visited = [];
   function showPage(number) {
     visited.push(number);
     list.querySelectorAll('.residence_block').forEach(node => node.remove());
-    list.insertAdjacentHTML('afterbegin', number === 1 ? card.outerHTML : brokenSecondPage ? '' : second.outerHTML);
-    pager.innerHTML = number === 1
-      ? '<li><a aria-current="page">1</a></li><li><a aria-label="Page 2">2</a></li><li><a aria-label="Next page" aria-disabled="false">Next</a></li>'
-      : '<li><a aria-label="Page 1">1</a></li><li><a aria-current="page">2</a></li><li><a aria-label="Next page" aria-disabled="true">Next</a></li>';
-    pager.querySelector('[aria-label="Next page"]').addEventListener('click',() => showPage(2));
-    pager.querySelector('[aria-label="Page 1"]')?.addEventListener('click',() => showPage(1));
+    if (number !== brokenPage) for (const row of pages[number-1]) {
+      const card = template.cloneNode(true);
+      card.querySelector('.price_text').innerHTML = '€'+row.rent.toFixed(2)+'<span class="excl">per month excl.*</span>';
+      card.querySelector('.residence_name').textContent = row.title?.endsWith(row.city) ? row.title : 'Example, '+row.city;
+      card.querySelector('a[href]').href = row.url;
+      card.querySelector('.booking_btn').textContent = row.status;
+      list.append(card);
+    }
+    pager.innerHTML = pages.map((_,i) => '<li><a '+(i+1===number ? 'aria-current="page"' : 'aria-label="Page '+(i+1)+'"')+'>'+(i+1)+'</a></li>').join('')+
+      '<li><a aria-label="Next page" aria-disabled="'+(number===pages.length)+'">Next</a></li>';
+    pager.querySelectorAll('[aria-label^="Page "]').forEach(link => link.addEventListener('click',() => showPage(Number(link.textContent))));
+    pager.querySelector('[aria-label="Next page"]').addEventListener('click',() => {if(number<pages.length) showPage(number+1);});
+    if (visited.length>1) onPage?.({number,document,selectCity});
   }
   showPage(1);
-  if (blocked) document.title = 'Just a moment...';
-  const storage = new Map();
-  const menus = new Map();
-  const intervals = [];
-  let clock = Date.parse(startTime);
-  let networkCalls = 0;
-  const messages = [];
+  if (blocked) document.title='Just a moment...';
+  const storage = new Map(), menus = new Map(), intervals = [], messages = [];
+  let clock = Date.parse(startTime), networkCalls = 0, reloads = 0;
   const prefix = 'h2s_single_city_den_haag:';
-  if (configured) {
-    storage.set(prefix+'token','123456:offline_test_token_not_real');
-    storage.set(prefix+'chatId','12345');
-  }
-  class Clock extends Date { constructor(...args) {super(...(args.length ? args : [clock]));} static now() {return clock;} }
+  if (initialState) storage.set(prefix+'state',structuredClone(initialState));
+  if (configured) {storage.set(prefix+'token','123456:offline_test_token_not_real');storage.set(prefix+'chatId','12345');}
+  const manualClick = (target = pager) => {for(const fn of handlers.get('click')||[]) fn({isTrusted:true,target});};
+  class Clock extends Date {constructor(...args){super(...(args.length?args:[clock]));}static now(){return clock;}}
   const sandbox = {document,window,Date:Clock,Intl,URL,console,crypto:require('node:crypto').webcrypto,
-    location:{pathname:'/residences',origin:'https://www.holland2stay.com',reload() {}},
-    navigator:{locks:{request:async (name,fn) => fn()}},
-    setTimeout(fn,ms) {queueMicrotask(() => {clock += ms;fn();});return 1;},clearTimeout() {},
-    setInterval(fn) {intervals.push(fn);return 1;},clearInterval() {},
-    MutationObserver:class {observe() {} disconnect() {}},
-    prompt:() => null,confirm:() => true,alert() {},
-    GM_getValue:(key,fallback) => storage.has(key) ? structuredClone(storage.get(key)) : fallback,
-    GM_setValue:(key,value) => storage.set(key,structuredClone(value)),
-    GM_registerMenuCommand:(label,fn) => menus.set(label,fn),
-    GM_xmlhttpRequest(request) {
+    location:{pathname:'/residences',origin:'https://www.holland2stay.com',reload(){reloads++;}},
+    navigator:{locks:{request:async(name,fn)=>fn()}},
+    setTimeout(fn,ms){queueMicrotask(()=>{clock+=ms;fn();});return 1;},clearTimeout(){},
+    setInterval(fn){intervals.push(fn);return 1;},clearInterval(){},MutationObserver:class{observe(){}disconnect(){}},
+    prompt:()=>null,confirm:()=>true,alert(){},
+    GM_getValue:(key,fallback)=>storage.has(key)?structuredClone(storage.get(key)):fallback,
+    GM_setValue:(key,value)=>storage.set(key,structuredClone(value)),GM_registerMenuCommand:(label,fn)=>menus.set(label,fn),
+    GM_xmlhttpRequest(request){
       networkCalls++;
-      if (!configured) throw Error('Unexpected notification');
-      messages.push(JSON.parse(request.data));
-      queueMicrotask(() => request.onload({status:200,responseText:JSON.stringify({ok:true,result:{message_id:messages.length}})}));
+      if(!configured) throw Error('Unexpected notification');
+      const attempt=networkCalls, body=JSON.parse(request.data);
+      queueMicrotask(()=>{
+        const response=onRequest?.({attempt,body,document,selectCity,manualClick});
+        if(response==='error'){request.onerror();return;}
+        if(response==='429'){request.onload({status:429,responseText:JSON.stringify({ok:false,parameters:{retry_after:60}})});return;}
+        messages.push(body);
+        request.onload({status:200,responseText:JSON.stringify({ok:true,result:{message_id:messages.length}})});
+      });
     }};
   vm.runInNewContext(source,sandbox,{filename:'h2s-monitor.user.js'});
-  return {document,storage,menus,intervals,visited,prefix,second,messages,get resets(){return resets;},get networkCalls(){return networkCalls;}};
+  return {document,storage,menus,intervals,visited,prefix,messages,selectCity,manualClick,
+    advance:ms=>{clock+=ms;},tick:()=>intervals[0](),
+    get history(){return storage.get(prefix+'state');},get panel(){return document.querySelector('#h2s-monitor-panel').textContent;},
+    get resets(){return resets;},get sortClicks(){return sortClicks;},get networkCalls(){return networkCalls;},get reloads(){return reloads;}};
 }
-async function drain() {for (let i = 0; i < 50; i++) await new Promise(resolve => setImmediate(resolve));}
-test('full runtime scans all pages and queues initial matches while Telegram is unconfigured', async () => {
-  const app = harness();
-  await drain();
-  const state = app.storage.get(app.prefix + 'state');
-  assert.ok(state?.initialized, app.document.querySelector('#h2s-monitor-panel').textContent + '\nVisited: ' + app.visited + '\nPage: ' + core.pagination(app.document).current);
-  assert.equal(Object.keys(state.items).length,2);
+async function drain(){for(let i=0;i<50;i++)await new Promise(resolve=>setImmediate(resolve));}
+const check = async app => {app.menus.get('立即检查（允许在夜间手动执行）')();await drain();};
+const rowsOf = history => Object.values(history.cities).flatMap(state=>Object.values(state.items));
+const priced = (rents,city='The Hague')=>rents.map((rent,i)=>sample({rent,city,title:'Example '+i+', '+city,url:sample().url.replace('example','r'+rent+'-'+i)}));
+
+test('global runtime scans sorted pages and retains initial notifications until Telegram is configured',async()=>{
+  const app=harness();await drain();
+  assert.equal(app.history.version,2);
+  assert.equal(rowsOf(app.history).filter(x=>x.pending).length,2);
   assert.deepEqual(app.visited,[1,2]);
   assert.equal(app.networkCalls,0);
-  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/首次完整扫描完成.*待发通知 2 条/);
-  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
-  check();await drain();
-  assert.deepEqual(app.visited,[1,2,1,2]);
+  assert.match(app.panel,/当前城市：全部城市/);
+  assert.match(app.panel,/当前范围待发 2/);
+  await check(app);assert.deepEqual(app.visited,[1,2,1,2]);
 });
-test('configured runtime sends first-scan matches automatically and repeated scans do not resend', async () => {
-  const app = harness({configured:true});
-  await drain();
+test('sort selection uses the observed ProductSort control and verifies the ascending label',async()=>{
+  const app=harness({sortMode:'unset',configured:true});await drain();
+  assert.equal(app.sortClicks,1);
   assert.equal(app.messages.length,2);
-  assert.ok(app.messages.every(message => message.chat_id==='12345' && message.text.includes('首次发现符合条件')));
-  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/本轮已通知 2 条/);
-  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
-  check();await drain();
+  assert.match(app.panel,/价格排序：从低到高/);
+});
+test('unknown sort and descending actual prices never initialize history or continue pagination',async()=>{
+  const unknown=harness({sortMode:'unset',canSort:false});await drain();
+  assert.equal(unknown.history,undefined);
+  assert.deepEqual(unknown.visited,[1]);
+  assert.match(unknown.panel,/未能确认升序/);
+  const unsorted=harness({pages:[priced([1200,900]),priced([1600])]});await drain();
+  assert.equal(unsorted.history,undefined);
+  assert.deepEqual(unsorted.visited,[1]);
+  assert.match(unsorted.panel,/等待价格升序生效/);
+});
+test('price cutoff stops requests after the first over-budget page, includes exactly €1500, and excludes lottery/other cities',async()=>{
+  const rows=priced([900,1000,1200,1500,1501,1800]);
+  rows[0].city='Amsterdam';rows[0].title='Example, Amsterdam';
+  rows[1].status='Available in lottery';
+  const app=harness({pages:[rows.slice(0,2),rows.slice(2,4),rows.slice(4)],configured:true});await drain();
+  assert.deepEqual(app.visited,[1,2,3]);
   assert.equal(app.messages.length,2);
-  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/本轮已通知 0 条/);
+  assert.ok(app.messages.some(x=>x.text.includes('€1500.00')));
+  assert.ok(Object.values(app.history.scans)[0].cutoff);
+  const early=harness({pages:[rows.slice(0,3),[rows[4]],[rows[5]]],configured:true});await drain();
+  assert.deepEqual(early.visited,[1,2]);
+  assert.equal(early.messages.length,1);
 });
-test('nighttime automatic scans pause; manual first scan sends matches without clearing history', async () => {
-  const app = harness({configured:true,startTime:'2026-10-03T22:00:00Z'});
-  await drain();
-  assert.equal(app.storage.has(app.prefix+'state'),false);
-  assert.equal(app.messages.length,0);
-  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
-  check();await drain();
-  assert.equal(app.messages.length,2);
-  check();await drain();
-  assert.equal(app.messages.length,2);
+test('an all-over-budget first page performs no next-page request and produces no listing notifications',async()=>{
+  const app=harness({pages:priced([1501,2000]).map(x=>[x]),configured:true});await drain();
+  assert.deepEqual(app.visited,[1]);assert.equal(app.messages.length,0);
+  assert.match(app.panel,/超预算位置，停止翻页/);
 });
-test('silent-reset and force-resend menus each apply once and preserve later deduplication', async () => {
-  const app = harness({configured:true});
-  await drain();
-  assert.equal(app.messages.length,2);
-  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
-  app.menus.get('清除历史并重建基线（不通知现有房源）')();await drain();
-  check();await drain();
-  assert.equal(app.messages.length,2);
-  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/已按选择建立静默基线/);
-  check();await drain();
-  assert.equal(app.messages.length,2);
-  app.menus.get('重新通知当前符合条件的房源（强制重发）')();await drain();
-  check();await drain();
-  assert.equal(app.messages.length,4);
-  assert.ok(app.messages.slice(2).every(message => message.text.includes('手动重新通知')));
-  check();await drain();
-  assert.equal(app.messages.length,4);
+test('cross-page price inversions, duplicate cards, and incomplete rendering preserve previous history',async()=>{
+  for(const settings of [
+    {pages:priced([1000,900]).map(x=>[x])},
+    {pages:[[sample()],[sample()]]},
+    {brokenPage:2}
+  ]){
+    const app=harness(settings);await drain();assert.equal(app.history,undefined,app.panel);
+  }
 });
-test('full runtime rejects a page that never finishes rendering without creating an empty baseline', async () => {
-  const app = harness({brokenSecondPage:true});
-  await drain();
-  assert.equal(app.storage.has(app.prefix + 'state'),false);
-  assert.equal(app.networkCalls,0);
-  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/未完成/);
+test('one allowed city is scanned without Reset, including when City options are collapsed',async()=>{
+  const app=harness({cityFilter:'The Hague',collapsedCity:true,configured:true});await drain();
+  assert.equal(app.messages.length,2);assert.equal(app.resets,0);
+  assert.match(app.panel,/当前城市：The Hague/);
+  assert.match(app.panel,/目标城市：是，属于目标五城/);
+  assert.match(app.panel,/扫描状态：本轮已完成/);
+  await check(app);assert.equal(app.messages.length,2);
 });
-test('full runtime pauses on a challenge and does not navigate or touch listing history', async () => {
-  const app = harness({blocked:true});
-  await drain();
-  assert.deepEqual(app.visited,[1]);
-  assert.equal(app.storage.has(app.prefix + 'state'),false);
-  assert.ok(app.storage.get(app.prefix + 'incident'));
-  assert.equal(app.networkCalls,0);
+test('non-target cities, multiple cities and extra filters do not trigger sorting, pagination or messages',async()=>{
+  for(const settings of [{cityFilter:'Amsterdam'},{cityFilter:['The Hague','Leiden']},{cityFilter:'The Hague',extraFilter:true}]){
+    const app=harness({...settings,sortMode:'unset',configured:true});await drain();
+    assert.equal(app.history,undefined);assert.equal(app.messages.length,0);assert.equal(app.sortClicks,0);
+    assert.equal(app.resets,0);assert.deepEqual(app.visited,[1]);assert.match(app.panel,/允许扫描：否/);
+  }
 });
-test('runtime clears website filters once and scans all cities without selecting any city option', async () => {
-  const app = harness({selectedFilter:true});
-  await drain();
-  assert.equal(app.resets,1);
-  assert.ok(app.storage.get(app.prefix+'state')?.initialized);
-  assert.equal(core.filterState(app.document).ok,true);
+test('stale listings and a city change during scanning cannot be accepted as a completed selected-city scan',async()=>{
+  const stale=harness({cityFilter:'Leiden'});await drain();assert.equal(stale.history,undefined);
+  const changed=harness({cityFilter:'The Hague',onPage:({number,selectCity})=>{if(number===2)selectCity('Leiden');}});
+  await drain();assert.equal(changed.history,undefined);assert.match(changed.panel,/筛选条件已改变/);
 });
-test('failed Reset cannot create a partial baseline or cause repeated reset clicks', async () => {
-  const app = harness({selectedFilter:true,resetFails:true});
-  await drain();
-  assert.equal(app.resets,1);
-  assert.equal(app.storage.has(app.prefix+'state'),false);
-  assert.deepEqual(app.visited,[1]);
+test('switching global to a single city and back keeps sent history and leaves unscanned cities untouched',async()=>{
+  const a=sample(), b=sample({city:'Leiden',title:'Example, Leiden',url:sample().url.replace('example','leiden')});
+  const global=harness({pages:[[a,b]],configured:true});await drain();assert.equal(global.messages.length,2);
+  const single=harness({pages:[[a]],cityFilter:'The Hague',configured:true,initialState:global.history});await drain();
+  assert.equal(single.messages.length,0);assert.equal(single.history.cities.leiden.items[b.url].missing,0);
+  const again=harness({pages:[[a,b]],configured:true,initialState:single.history});await drain();
+  assert.equal(again.messages.length,0);assert.equal(again.history.sent,2);
 });
-test('a city absent from the dynamic City options can appear later and generates a new listing alert', async () => {
-  const app = harness({initialCity:'Rijswijk'});
-  await drain();
-  const before = app.storage.get(app.prefix+'state');
-  assert.ok(before?.initialized);
-  assert.ok(Object.values(before.items).every(x => x.city==='Rijswijk'));
-  const url = 'https://www.holland2stay.com/residences/new-hague.html';
-  app.second.querySelector('.residence_name').textContent='New 1, The Hague';
-  app.second.querySelector('a[href]').href=url;
-  // The website still exposes only Rijswijk in its City filter; monitoring must work anyway.
-  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
-  check();await drain();
-  const after = app.storage.get(app.prefix+'state');
-  assert.equal(after.scope,before.scope);
-  assert.equal(after.items[url]?.pending?.reason,'新房源');
-  assert.equal(app.resets,0);
+test('nighttime manual scanning sends matches and repeated checks stay deduplicated',async()=>{
+  const app=harness({configured:true,startTime:'2026-10-03T22:00:00Z'});await drain();
+  assert.equal(app.history,undefined);assert.equal(app.sortClicks,0);
+  await check(app);assert.equal(app.messages.length,2);
+  await check(app);assert.equal(app.messages.length,2);
 });
-test('runtime scans unrelated cities but only tracks the requested five for notifications', async () => {
-  const app = harness({outsideFirst:true});
-  await drain();
-  const state = app.storage.get(app.prefix+'state');
-  assert.ok(state?.initialized);
-  assert.equal(Object.keys(state.items).length,1);
-  assert.equal(Object.values(state.items)[0].city,'The Hague');
-  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/全站扫描 2 套/);
+test('same-scope user pagination during delivery does not interrupt a 31-message batch after six successes',async()=>{
+  const app=harness({pages:[priced(Array(31).fill(900))],configured:true,
+    onRequest:({attempt,manualClick})=>{if(attempt===6)manualClick();}});
+  await drain();assert.equal(app.messages.length,31);assert.equal(app.history.sent,31);
+  assert.match(app.panel,/当前范围待发 0/);
+  assert.doesNotMatch(app.panel,/Telegram：检测到手动操作/);
+});
+test('six successes followed by rate limiting show 25 pending and resume at night without another H2S sweep',async()=>{
+  const app=harness({pages:[priced(Array(31).fill(900))],configured:true,startTime:'2026-10-03T22:00:00Z',
+    onRequest:({attempt})=>attempt===7?'429':undefined});
+  await drain();await check(app);
+  assert.equal(app.messages.length,6);assert.match(app.panel,/当前范围待发 25/);
+  app.advance(61000);app.tick();await drain();
+  assert.equal(app.messages.length,31);assert.equal(app.history.sent,31);
+  assert.deepEqual(app.visited,[1]);assert.match(app.panel,/当前范围待发 0/);
+});
+test('changing city during sending preserves pending records and reports a control pause separately from Telegram',async()=>{
+  const app=harness({pages:[priced(Array(10).fill(900))],configured:true,
+    onRequest:({attempt,selectCity})=>{if(attempt===6)selectCity('Leiden');}});
+  await drain();assert.equal(app.messages.length,6);
+  assert.equal(rowsOf(app.history).filter(x=>x.pending).length,4);
+  assert.match(app.panel,/通知已暂停/);assert.match(app.panel,/Telegram：发送成功/);
+});
+test('old all-city records migrate on upgrade, send pending only, and preserve prior cumulative counts',async()=>{
+  const a=sample(),b=sample({url:sample().url.replace('example','new')});
+  const old={version:1,scope:'old-all-cities',initialized:true,sent:6,items:{
+    [a.url]:{...a,eligible:true,missing:0,lastSeen:10,lastNotified:20,pending:null},
+    [b.url]:{...b,eligible:true,missing:0,lastSeen:10,pending:{reason:'新房源',detectedAt:10}}
+  }};
+  const app=harness({pages:[[a,b]],configured:true,initialState:old});await drain();
+  assert.equal(app.messages.length,1);assert.ok(app.messages[0].text.includes(b.url));assert.equal(app.history.sent,7);
+});
+test('silent reset and forced resend apply only to the current scope and later scans still deduplicate',async()=>{
+  const app=harness({cityFilter:'The Hague',configured:true});await drain();assert.equal(app.messages.length,2);
+  app.menus.get('清除历史并重建基线（不通知现有房源）')();await drain();await check(app);
+  assert.equal(app.messages.length,2);assert.match(app.panel,/静默记录/);
+  await check(app);assert.equal(app.messages.length,2);
+  app.menus.get('重新通知当前符合条件的房源（强制重发）')();await drain();await check(app);
+  assert.equal(app.messages.length,4);await check(app);assert.equal(app.messages.length,4);
+});
+test('challenge pages pause without sorting, pagination, or altering listing history',async()=>{
+  const app=harness({blocked:true});await drain();assert.equal(app.history,undefined);
+  assert.deepEqual(app.visited,[1]);assert.equal(app.sortClicks,0);assert.match(app.panel,/验证暂停/);
 });
