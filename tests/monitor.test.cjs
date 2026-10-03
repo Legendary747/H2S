@@ -8,6 +8,7 @@ const core = require('../h2s-monitor.user.js');
 const fixture = fs.readFileSync(__dirname + '/fixtures/residences.html', 'utf8');
 const selectedCityFixture = fs.readFileSync(__dirname + '/fixtures/the-hague-filters.html', 'utf8');
 const selectedCityPage = fs.readFileSync(__dirname + '/fixtures/the-hague-listings.html', 'utf8');
+const actualSortMenu = fs.readFileSync(__dirname + '/fixtures/sort-menu.html', 'utf8');
 const source = fs.readFileSync(__dirname + '/../h2s-monitor.user.js', 'utf8');
 const targets = ['The Hague','Rijswijk','Rotterdam','Leiden','Zoetermeer'];
 const documentOf = () => parseHTML(fixture).document;
@@ -102,6 +103,22 @@ test('plain Price selection is recognized without certifying ascending main-rent
   root.setAttribute('aria-busy','true');
   assert.equal(core.priceSortState(document).selected,false);
   for(const label of ['Available start date','Price: High to Low','Sort ...']) assert.equal(core.isPriceChoice(label),false);
+});
+test('actual SortItem-activeButton determines selection even while the trigger still says Sort ...', () => {
+  const {document} = parseHTML(actualSortMenu);
+  const date = document.querySelector('[data-cy="SortItem-activeButton"]');
+  const price = document.querySelector('[data-cy="SortItem-button"]');
+  const trigger = document.querySelector('[data-cy="ProductSort-sortButton"]');
+  assert.equal(core.priceSortState(document).selected,false,'An available Price option is not a selected price sort');
+  date.setAttribute('data-cy','SortItem-button');
+  price.setAttribute('data-cy','SortItem-activeButton');
+  assert.equal(core.priceSortState(document).selected,true);
+  assert.equal(core.priceSortState(document).ok,false,'Price still has no direction');
+  date.setAttribute('data-cy','SortItem-activeButton');
+  price.setAttribute('data-cy','SortItem-button');
+  trigger.textContent='Price: Low to High';
+  assert.equal(core.priceSortState(document).selected,false,'The active date choice overrides a stale trigger label');
+  assert.equal(core.priceSortState(document).ok,false);
 });
 test('uploaded The Hague page has nine unsorted listings, with only three direct-booking matches within €1500', () => {
   const page=core.parsePage(parseHTML(selectedCityPage).document);
@@ -248,7 +265,7 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
 // clock, and mocked Telegram responses. No real network requests are made.
 function harness({pages, cityFilter = null, collapsedCity = false, extraFilter = false, actualCityControls = false,
   sortMode = 'asc', sortOptionLabel = 'Price: Low to High', sortOptionTag = 'button', canSort = true, configured = false, blocked = false, brokenPage = 0,
-  startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
+  actualSortControls = false, sortMenuOpen = false, startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
   pages ||= [[sample()], [sample({rent:1000,url:sample().url.replace('example','second')})]];
   const {document,window} = parseHTML(fixture);
   const template = document.querySelectorAll('.residence_block')[6].cloneNode(true);
@@ -281,14 +298,33 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
   let sorting = document.querySelector('[data-cy="ProductSort-root"]');
   if (!sorting) {sorting = document.createElement('div');sorting.setAttribute('data-cy','ProductSort-root');document.body.append(sorting);}
   sorting.innerHTML = '<button data-cy="ProductSort-sortButton">'+(sortMode==='asc' ? 'Price: Low to High' : sortMode==='desc' ? 'Price: High to Low' : sortMode==='price' ? 'Price' : 'Sort ...')+'</button>';
-  let sortClicks = 0;
-  sorting.querySelector('button').addEventListener('click',() => {
-    sortClicks++;
-    if (!canSort || sorting.querySelector('.price-option')) return;
-    const option = document.createElement(sortOptionTag);option.className='price-option';option.textContent=sortOptionLabel;
-    option.addEventListener('click',() => {sorting.querySelector('[data-cy="ProductSort-sortButton"]').textContent=sortOptionLabel;option.remove();showPage(1);});
-    sorting.append(option);
-  });
+  let sortClicks = 0, sortOptionClicks = 0;
+  if(actualSortControls){
+    sorting.innerHTML=parseHTML(actualSortMenu).document.querySelector('[data-cy="ProductSort-root"]').innerHTML;
+    sorting.setAttribute('aria-busy','false');
+    const menu=sorting.querySelector('div');
+    const options=[...menu.querySelectorAll('button')];
+    if(sortMode==='price') options.forEach(button=>button.setAttribute('data-cy',button.textContent.trim()==='Price'?'SortItem-activeButton':'SortItem-button'));
+    if(!sortMenuOpen) menu.remove();
+    sorting.querySelector('[data-cy="ProductSort-sortButton"]').addEventListener('click',()=>{
+      sortClicks++;
+      if(menu.parentElement) menu.remove();else sorting.append(menu);
+    });
+    options.forEach(button=>button.addEventListener('click',()=>{
+      sortOptionClicks++;
+      options.forEach(option=>option.setAttribute('data-cy',option===button?'SortItem-activeButton':'SortItem-button'));
+      // Keep the header at Sort ... to test the actual active-item marker.
+      showPage(1);
+    }));
+  }else{
+    sorting.querySelector('button').addEventListener('click',() => {
+      sortClicks++;
+      if (!canSort || sorting.querySelector('.price-option')) return;
+      const option = document.createElement(sortOptionTag);option.className='price-option';option.textContent=sortOptionLabel;
+      option.addEventListener('click',() => {sortOptionClicks++;sorting.querySelector('[data-cy="ProductSort-sortButton"]').textContent=sortOptionLabel;option.remove();showPage(1);});
+      sorting.append(option);
+    });
+  }
   if(sortMode==='missing') sorting.remove();
   const visited = [];
   function showPage(number) {
@@ -341,7 +377,7 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
   return {document,storage,menus,intervals,visited,prefix,messages,selectCity,manualClick,
     advance:ms=>{clock+=ms;},tick:()=>intervals[0](),
     get history(){return storage.get(prefix+'state');},get panel(){return document.querySelector('#h2s-monitor-panel').textContent;},
-    get resets(){return resets;},get sortClicks(){return sortClicks;},get networkCalls(){return networkCalls;},get reloads(){return reloads;}};
+    get resets(){return resets;},get sortClicks(){return sortClicks;},get sortOptionClicks(){return sortOptionClicks;},get networkCalls(){return networkCalls;},get reloads(){return reloads;}};
 }
 async function drain(){for(let i=0;i<50;i++)await new Promise(resolve=>setImmediate(resolve));}
 const check = async app => {app.menus.get('立即检查（允许在夜间手动执行）')();await drain();};
@@ -387,6 +423,27 @@ test('Price-only menu can be selected automatically; full city pagination includ
   assert.equal(app.messages.length,2);assert.equal(rowsOf(app.history).length,3);
   assert.match(app.panel,/已选择 Price，升序方向未确认/);assert.match(app.panel,/读完当前城市全部页/);
   assert.equal(Object.values(app.history.scans)[0].cutoff,false);
+});
+test('actual nested Sort menu clicks the inner Price button, then scans the selected city at night',async()=>{
+  for(const sortMenuOpen of [false,true]){
+    const app=harness({cityFilter:'The Hague',actualSortControls:true,sortMenuOpen,configured:true,startTime:'2026-10-03T22:00:00Z'});
+    await drain();await check(app);
+    assert.equal(app.sortOptionClicks,1,'Price must be clicked on the button, not its parent li');
+    assert.equal(app.sortClicks,sortMenuOpen?0:1,'An already open menu must not be closed');
+    assert.equal(app.document.querySelector('[data-cy="SortItem-activeButton"]').textContent.trim(),'Price');
+    assert.deepEqual(app.visited,[1,1,2]);assert.equal(app.messages.length,2);
+    assert.match(app.panel,/已选择 Price，升序方向未确认/);
+    await check(app);assert.equal(app.sortOptionClicks,1);assert.equal(app.messages.length,2);
+  }
+});
+test('actual active Price needs no click; actual global menu selects Price but keeps unknown-order pagination blocked',async()=>{
+  const single=harness({cityFilter:'The Hague',actualSortControls:true,sortMenuOpen:true,sortMode:'price',configured:true});
+  await drain();
+  assert.equal(single.sortOptionClicks,0);assert.equal(single.sortClicks,0);assert.equal(single.messages.length,2);
+  const global=harness({actualSortControls:true,sortMenuOpen:true,configured:true});await drain();
+  assert.equal(global.sortOptionClicks,1);assert.equal(global.sortClicks,0);
+  assert.deepEqual(global.visited,[1,1]);assert.equal(global.messages.length,0);assert.equal(global.history,undefined);
+  assert.match(global.panel,/官网只显示 Price/);assert.match(global.panel,/请手动选择一个目标城市/);
 });
 test('already selected Price avoids reopening the menu; absent Sort still permits complete city scanning',async()=>{
   for(const sortMode of ['price','missing']){

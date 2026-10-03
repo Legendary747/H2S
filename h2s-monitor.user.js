@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.2
+// @version      1.3.3
 // @description  Scan H2S selected-city listings, use verified ascending rent for budget cutoff, and notify for five allowed cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -186,8 +186,11 @@
   function priceSortState(doc) {
     const root = doc.querySelector('[data-cy="ProductSort-root"]');
     const button = root?.querySelector('[data-cy="ProductSort-sortButton"]');
-    const chosen = root?.querySelector('[aria-selected="true"],[aria-checked="true"],input:checked');
-    const labels = [text(button), chosen && (text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label'))];
+    const chosen = root?.querySelector('[data-cy="SortItem-activeButton"]') ||
+      root?.querySelector('[aria-selected="true"],[aria-checked="true"],input:checked');
+    // H2S can keep the trigger at "Sort ..." while the menu marks the actual
+    // selection with SortItem-activeButton. That selection overrides the trigger.
+    const labels = chosen ? [text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label')] : [text(button)];
     const ready = root?.getAttribute('aria-busy') !== 'true';
     // The actual menu says only "Price". That is a selected price sort, but does
     // not prove global ascending main-rent order (availability may be grouped).
@@ -373,8 +376,12 @@
     if (initial.selected || !initial.button) return initial;
     setStatus('准备排序', '正在选择官网 Price 价格排序');
     const findOption = sorting => {
-      const candidates = [...(sorting.root?.querySelectorAll('button,a,[role="option"],[role="menuitem"],label,li,div,span') || []),
-        ...document.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]')]
+      // The supplied menu is li > button > span. Clicking the li does not click
+      // its child button or invoke the button's handler, so prefer actual controls.
+      const candidates = [...(sorting.root?.querySelectorAll('button[data-cy="SortItem-button"],button[data-cy="SortItem-activeButton"]') || []),
+        ...(sorting.root?.querySelectorAll('button,a,[role="option"],[role="menuitem"],label') || []),
+        ...document.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]'),
+        ...[...(sorting.root?.querySelectorAll('li') || [])].filter(node => !node.querySelector('button,a,[role="option"],[role="menuitem"],label'))]
         .filter(node => node !== sorting.button && !sorting.button?.contains(node) &&
           !node.closest('[hidden],[aria-hidden="true"]') && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true');
       return candidates.find(node => isAscendingPrice(text(node))) || candidates.find(node => isPriceChoice(text(node)));
