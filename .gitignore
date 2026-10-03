@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+uploads/
+private/
+browser-profile/
+storage-state*.json
+h2s.html
+h2s_files/
