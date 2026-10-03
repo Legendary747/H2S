@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.0.0
-// @description  Monitor rendered H2S listings; notify via Telegram; pause for human verification.
+// @version      1.1.0
+// @description  Scan all H2S cities and locally notify for The Hague, Rijswijk, Rotterdam, Leiden and Zoetermeer.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
 // @grant        GM_getValue
@@ -17,9 +17,11 @@
 (() => {
   'use strict';
 
-  // Change these three values (and @name) to monitor another city.
-  const TARGET_CITY = 'Den Haag';
+  // City options change with availability. Never depend on them to find future listings.
+  const TARGET_CITIES = ['The Hague', 'Rijswijk', 'Rotterdam', 'Leiden', 'Zoetermeer'];
   const MAX_RENT = 1000;
+  const AUTO_RESET_FILTERS = true;
+  // Keep the original @name and prefix so an in-place update preserves Telegram configuration.
   const STORAGE_PREFIX = 'h2s_single_city_den_haag';
   const TIME_ZONE = 'Europe/Amsterdam';
   const START_HOUR = 7;
@@ -36,6 +38,9 @@
     const key = clean(value).toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
     return ['den haag', 'the hague', "'s-gravenhage", 's-gravenhage'].includes(key) ? 'den haag' : key;
   }
+  const cityKeys = targets => [...new Set((Array.isArray(targets) ? targets : [targets]).map(cityKey))].sort();
+  const matchesCity = (city, targets) => cityKeys(targets).includes(cityKey(city));
+  const CITY_LABEL = TARGET_CITIES.join(', ');
   function money(value) {
     let number = clean(value).replace(/[€\s\u00a0]/g, '');
     if (!/^\d+(?:[.,]\d+)*$/.test(number)) return null;
@@ -124,13 +129,13 @@
     if (!doc.querySelector('.residence_MainSection')) throw Error('无法确认房源列表区域');
     return {listings, total, page: pagination(doc)};
   }
-  function citySelection(doc, target) {
-    const root = doc.querySelector('[aria-label="Filter products by City"]');
-    const inputs = root ? [...root.querySelectorAll('input[type="checkbox"]')] : [];
-    if (!inputs.length) return {ok: false, unknown: true, reason: '请展开 City，并只选择 ' + target};
-    const names = inputs.filter(input => input.checked).map(input => clean(input.getAttribute('title') || text(input.closest('label')).replace(/\s*\(\d+\)\s*$/, '')));
-    const ok = names.length === 1 && cityKey(names[0]) === cityKey(target);
-    return {ok, unknown: false, reason: ok ? '' : 'City 必须只选择 ' + target + '；当前：' + (names.join(', ') || '未选择')};
+  function filterState(doc) {
+    const root = doc.querySelector('.selected_filter [aria-label="Current Filters"]');
+    if (!root) return {ok: false, unknown: true, reason: '尚未加载已应用筛选区域'};
+    const inputs = [...doc.querySelectorAll('[aria-label^="Filter products by "] input[type="checkbox"], [aria-label^="Filter products by "] input[type="radio"]')];
+    const selected = inputs.some(input => input.checked);
+    const ok = root.children.length === 0 && !text(root) && !selected;
+    return {ok, unknown: false, reason: ok ? '' : '页面存在筛选条件；需要恢复全部城市列表'};
   }
   function challenge(doc) {
     // A normal embedded Turnstile widget or the word "Cloudflare" is NOT a challenge page.
@@ -145,9 +150,8 @@
     const hour = Number(new Intl.DateTimeFormat('en-GB', {timeZone: TIME_ZONE, hour: '2-digit', hourCycle: 'h23'}).format(date));
     return hour >= START_HOUR && hour < END_HOUR;
   }
-  function validateSweep(listings, total, target) {
+  function validateSweep(listings, total) {
     if (new Set(listings.map(item => item.url)).size !== total || listings.length !== total) throw Error('分页结果不完整或重复；本轮不更新历史');
-    if (listings.some(item => cityKey(item.city) !== cityKey(target))) throw Error('卡片城市与目标不一致，请等待筛选完成');
   }
   function freshState(scope) { return {version: VERSION, scope, initialized: false, items: {}, sent: 0}; }
   function reconcile(previous, listings, scope, target, maxRent, now) {
@@ -156,7 +160,7 @@
     const observed = new Set(listings.map(item => item.url));
     for (const item of listings) {
       const old = state.items[item.url];
-      const eligible = cityKey(item.city) === cityKey(target) && item.rent <= maxRent && directStatus(item.status);
+      const eligible = matchesCity(item.city, target) && item.rent <= maxRent && directStatus(item.status);
       let reason = null;
       if (!baseline && eligible) {
         if (!old) reason = '新房源';
@@ -192,8 +196,8 @@
 
   // The userscript is also directly importable by the offline regression tests.
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = {cityKey, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
-      citySelection, challenge, withinHours, validateSweep, freshState, reconcile, deliverPending};
+    module.exports = {cityKey, cityKeys, matchesCity, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
+      filterState, challenge, withinHours, validateSweep, freshState, reconcile, deliverPending};
     return;
   }
   if (!/^\/residences\/?$/.test(location.pathname)) return; // Never run on a booking/detail page.
@@ -211,7 +215,6 @@
   let lastScope = '';
   let nextTelegramAttempt = 0;
   let retryNoticeAt = 0;
-  let guardOpenedAt = 0;
   let daytime = withinHours();
   let maintenanceUntil = 0;
   const stats = {message: '正在启动', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
@@ -224,9 +227,9 @@
   function configured() { return Boolean(get('token', '') && get('chatId', '')); }
   function render() {
     const state = get('state', null);
-    panel.textContent = ['H2S · ' + TARGET_CITY + ' · 主租金 ≤ €' + MAX_RENT,
+    panel.textContent = ['H2S · 五城市监控 · 主租金 ≤ €' + MAX_RENT, CITY_LABEL,
       (isLeader ? '' : '待机：') + stats.message,
-      '扫描 ' + stats.scanned + ' 套 · 符合 ' + stats.matched + ' 套 · 第 ' + stats.pages + ' 页',
+      '全站扫描 ' + stats.scanned + ' 套 · 五城符合 ' + stats.matched + ' 套 · 第 ' + stats.pages + ' 页',
       '本轮通知 ' + stats.sent + ' · 累计 ' + (state?.sent || 0),
       'Telegram：' + (configured() ? stats.telegram === '未配置' ? '已配置' : stats.telegram : '未配置（菜单设置）'),
       '上次完整扫描 ' + formatTime(state?.lastCompleteScan),
@@ -235,27 +238,41 @@
   function setMessage(message) { stats.message = message; render(); }
   function scheduleRefresh() { nextRefresh = Date.now() + (REFRESH_MINUTES[0] + Math.random() * (REFRESH_MINUTES[1] - REFRESH_MINUTES[0])) * 60000; }
   function filtersFingerprint() {
-    const selected = text(document.querySelector('.selected_filter'));
-    return JSON.stringify([cityKey(TARGET_CITY), MAX_RENT, selected]);
+    // Availability-derived city options must not change the baseline scope.
+    return JSON.stringify(['all-cities-v1', cityKeys(TARGET_CITIES), MAX_RENT]);
   }
-  function assertAllowed(scope, manual) {
+  function assertRunning(manual) {
     if (!isLeader || get('paused', false)) throw Error('监控已暂停');
     if (challenge(document)) throw Error('检测到验证页面，已停止操作');
     if (!manual && !withinHours()) throw Error('已进入夜间暂停时段');
-    const selection = citySelection(document, TARGET_CITY);
-    if (!selection.ok) throw Error(selection.reason);
+    if (Date.now() < maintenanceUntil) throw Error('检测到手动操作，等待 30 秒后继续');
+  }
+  function assertAllowed(scope, manual) {
+    assertRunning(manual);
+    const filters = filterState(document);
+    if (!filters.ok) throw Error(filters.reason);
     if (filtersFingerprint() !== scope) throw Error('筛选条件已改变；本轮已取消');
   }
-  async function ensureCityControls() {
-    const selection = citySelection(document, TARGET_CITY);
-    if (!selection.unknown) return selection;
-    const toggle = document.querySelector('[aria-label="Filter products by City"] .card-header a');
-    if (toggle?.getAttribute('aria-expanded') === 'false' && Date.now() - guardOpenedAt > 30000) {
-      guardOpenedAt = Date.now();
-      toggle.click(); // Only expand the visible City controls; never select filters for the user.
-      await sleep(800);
+  async function ensureUnfiltered(manual) {
+    const start = Date.now();
+    let resetClicked = false;
+    while (Date.now() - start < MAX_SETTLE_MS) {
+      assertRunning(manual);
+      const filters = filterState(document);
+      if (filters.ok) return;
+      if (!filters.unknown && !resetClicked) {
+        if (!AUTO_RESET_FILTERS) throw Error('请点击官网 Reset 清除筛选，保持全部城市');
+        const reset = document.querySelector('.residenceFilter .reset_text');
+        if (!reset || !/^reset$/i.test(text(reset))) throw Error('检测到筛选，但未找到 Reset；请手动清除网页筛选');
+        if (Date.now() - get('lastFilterReset', 0) < 30000) throw Error('刚重置后仍有筛选，请手动点击 Reset；暂不重复刷新');
+        setMessage('正在清除网页筛选，恢复全部城市列表');
+        set('lastFilterReset', Date.now());
+        reset.click();
+        resetClicked = true;
+      }
+      await sleep(500);
     }
-    return citySelection(document, TARGET_CITY);
+    throw Error('未能确认全部城市列表；请手动点击 Reset 后重试');
   }
   function fingerprint(result) {
     return JSON.stringify([result.total, result.page.current, result.page.last, result.listings.map(item => [item.url, item.rent, item.status])]);
@@ -320,7 +337,7 @@
     if (incident.sent || !configured() || Date.now() < retryNoticeAt) return;
     retryNoticeAt = Date.now() + 60000;
     try {
-      await sendText('H2S · ' + TARGET_CITY + '\n监控遇到验证或访问受阻，已暂停自动刷新。请在运行脚本的浏览器中手动处理。\n' + location.origin + location.pathname);
+      await sendText('H2S · ' + CITY_LABEL + '\n监控遇到验证或访问受阻，已暂停自动刷新。请在运行脚本的浏览器中手动处理。\n' + location.origin + location.pathname);
       incident.sent = true;
       set('incident', incident);
     } catch { stats.telegram = '验证提醒发送失败，稍后重试'; render(); }
@@ -334,12 +351,11 @@
     let scope;
     try {
       if (challenge(document)) { await notifyBlock(); return; }
-      const selection = await ensureCityControls();
-      if (!selection.ok) { nextRefresh = 0; setMessage(selection.reason); return; }
+      await ensureUnfiltered(manual);
       scope = filtersFingerprint();
       lastScope = scope;
       assertAllowed(scope, manual);
-      setMessage('等待页面稳定，准备扫描全部分页');
+      setMessage('等待全部城市列表稳定，准备扫描全部分页');
       let result = await stablePage(scope, manual);
       if (result.page.current !== 1) {
         if (!result.page.first) throw Error('找不到第 1 页，无法进行完整扫描');
@@ -354,7 +370,7 @@
         if (result.total !== total || result.page.current !== n) throw Error('分页期间结果总数或页码变化；本轮不更新历史');
         listings.push(...result.listings);
         stats.scanned = listings.length;
-        stats.matched = listings.filter(item => cityKey(item.city) === cityKey(TARGET_CITY) && item.rent <= MAX_RENT && directStatus(item.status)).length;
+        stats.matched = listings.filter(item => matchesCity(item.city, TARGET_CITIES) && item.rent <= MAX_RENT && directStatus(item.status)).length;
         stats.pages = n;
         setMessage('扫描第 ' + n + ' 页，共 ' + total + ' 套');
         if (!result.page.next) break;
@@ -363,10 +379,11 @@
         result.page.next.click();
         result = await stablePage(scope, manual, n + 1, old);
       }
-      validateSweep(listings, total, TARGET_CITY);
+      validateSweep(listings, total);
       assertAllowed(scope, manual);
       const oldState = get('state', null);
-      const {state, baseline} = reconcile(oldState, listings, scope, TARGET_CITY, MAX_RENT, Date.now());
+      const targetListings = listings.filter(item => matchesCity(item.city, TARGET_CITIES));
+      const {state, baseline} = reconcile(oldState, targetListings, scope, TARGET_CITIES, MAX_RENT, Date.now());
       if (get('notifyExisting', false)) {
         for (const item of Object.values(state.items)) if (item.eligible && !item.missing) item.pending = {reason: '手动重新通知', detectedAt: Date.now()};
         set('notifyExisting', false);
@@ -410,10 +427,9 @@
     if (!isLeader || scanRunning) return;
     if (get('paused', false)) { nextRefresh = 0; setMessage('手动暂停；菜单可恢复'); return; }
     if (challenge(document)) { await notifyBlock(); return; }
-    if (get('incident', null)) { set('incident', null); dirty = true; retryAt = 0; guardOpenedAt = 0; }
+    if (get('incident', null)) { set('incident', null); dirty = true; retryAt = 0; }
     if (!withinHours()) { daytime = false; nextRefresh = 0; setMessage('夜间暂停；菜单可手动立即检查'); return; }
-    const selection = await ensureCityControls();
-    if (!selection.ok) { nextRefresh = 0; setMessage(selection.reason); return; }
+    if (!filterState(document).ok) { dirty = true; nextRefresh = 0; }
     if (!daytime) { daytime = true; location.reload(); return; }
     if (lastScope && filtersFingerprint() !== lastScope) { dirty = true; retryAt = 0; nextRefresh = 0; }
     // Refresh fresh server-rendered data before starting the next scheduled cycle.
@@ -453,7 +469,7 @@
     set('chatId', value.trim()); dirty = true; render();
   });
   register('测试 Telegram', async () => {
-    await sendText('H2S 测试成功 · ' + TARGET_CITY + ' · 主租金 ≤ €' + MAX_RENT + '\n此消息只验证 Telegram 配置，不代表已发现新房源。');
+    await sendText('H2S 测试成功 · ' + CITY_LABEL + ' · 主租金 ≤ €' + MAX_RENT + '\n此消息只验证 Telegram 配置，不代表已发现新房源。');
     stats.telegram = '测试成功'; render();
   });
   register('立即检查（允许在夜间手动执行）', async () => { requireIdle(); await runScan(true); });
@@ -475,7 +491,7 @@
     alert(items.length ? items.slice(0, 100).map(item => item.title + '\n€' + item.rent + ' · ' + item.status + (item.pending ? ' · 待通知' : '') + '\n' + item.url).join('\n\n') : '暂无完整扫描历史');
   });
   register('测试 Cloudflare 提醒（仅发送测试消息）', async () => {
-    await sendText('H2S 验证提醒测试 · ' + TARGET_CITY + '\n这是测试消息。真实遇到验证时，会停止自动刷新并等待你手动处理。');
+    await sendText('H2S 验证提醒测试 · ' + CITY_LABEL + '\n这是测试消息。真实遇到验证时，会停止自动刷新并等待你手动处理。');
     stats.telegram = '验证提醒测试成功'; render();
   });
 
@@ -495,7 +511,7 @@
   });
   observer.observe(document.body, {childList: true, subtree: true, characterData: true});
   document.addEventListener('change', event => {
-    if (event.target.closest?.('#filter_accordion')) { dirty = true; nextRefresh = 0; retryAt = Date.now() + 2000; }
+    if (!scanRunning && event.target.closest?.('#filter_accordion')) { dirty = true; nextRefresh = 0; retryAt = Date.now() + 2000; }
   });
   document.addEventListener('click', event => {
     if (event.isTrusted && event.target.closest?.('.residence_pagination,#filter_accordion,.selected_filter')) {

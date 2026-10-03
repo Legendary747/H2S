@@ -7,6 +7,7 @@ const {parseHTML} = require('linkedom');
 const core = require('../h2s-monitor.user.js');
 const fixture = fs.readFileSync(__dirname + '/fixtures/residences.html', 'utf8');
 const source = fs.readFileSync(__dirname + '/../h2s-monitor.user.js', 'utf8');
+const targets = ['The Hague','Rijswijk','Rotterdam','Leiden','Zoetermeer'];
 const documentOf = () => parseHTML(fixture).document;
 const sample = (overrides = {}) => ({url: 'https://www.holland2stay.com/residences/example.html', title: 'Example 1, The Hague', city: 'The Hague', rent: 900, status: 'Book directly', ...overrides});
 const update = (state, rows, time = 100) => core.reconcile(state, rows, 'scope', 'Den Haag', 1000, time).state;
@@ -34,22 +35,27 @@ test('URL normalization removes tracking, rejects unrelated or booking URLs', ()
   assert.equal(core.normalizeUrl('/residences'),null);
   assert.equal(core.normalizeUrl('javascript:alert(1)'),null);
 });
-test('unselected, unknown and multi-city filters cannot silently monitor the wrong city', () => {
+test('all-city monitoring does not depend on City options, and detects any applied filters', () => {
   const doc = documentOf();
-  assert.equal(core.citySelection(doc, 'Den Haag').ok,false);
+  assert.equal(core.filterState(doc).ok,true);
   const section = doc.querySelector('[aria-label="Filter products by City"]');
-  section.insertAdjacentHTML('beforeend','<label>The Hague<input type="checkbox" title="The Hague"></label><label>Rijswijk<input type="checkbox" title="Rijswijk"></label>');
-  const [hague, other] = section.querySelectorAll('input');
-  hague.checked = true;
-  assert.equal(core.citySelection(doc,'Den Haag').ok,true);
-  other.checked = true;
-  assert.equal(core.citySelection(doc,'Den Haag').ok,false);
+  section.innerHTML = '<label>Rijswijk (4)<input type="checkbox" title="Rijswijk"></label>';
+  assert.equal(core.filterState(doc).ok,true); // The Hague does not even exist as an option.
+  section.querySelector('input').checked = true;
+  assert.equal(core.filterState(doc).ok,false);
+  section.remove();
+  assert.equal(core.filterState(doc).ok,true);
+  const selected = doc.querySelector('[aria-label="Current Filters"]');
+  selected.innerHTML = '<li>Rent p/month: €0–€900</li>';
+  assert.equal(core.filterState(doc).ok,false);
+  selected.remove();
+  assert.equal(core.filterState(doc).unknown,true);
 });
-test('partial, duplicate, wrong-city, loading and malformed pages cannot form a baseline', () => {
+test('partial, duplicate, loading and malformed pages cannot form a baseline; mixed cities are valid', () => {
   const page = core.parsePage(documentOf());
   assert.throws(() => core.validateSweep(page.listings,109,'Den Haag'));
   assert.throws(() => core.validateSweep([sample(), sample()],2,'Den Haag'));
-  assert.throws(() => core.validateSweep([sample({city:'Rijswijk'})],1,'Den Haag'));
+  assert.doesNotThrow(() => core.validateSweep([sample({city:'Amsterdam'})],1));
   const doc = documentOf();
   doc.querySelector('.residence_MainSection').innerHTML = '';
   assert.throws(() => core.parsePage(doc));
@@ -78,6 +84,17 @@ test('first scan suppresses existing listings; later newly eligible listings cre
   state = update(null,[sample({status:'Available in lottery'})]);
   state = update(state,[item]);
   assert.equal(state.items[item.url].pending.reason,'变为可直接预订');
+});
+test('notifications include exactly the five cities, recognize Den Haag, and preserve budget/status filters', () => {
+  const rows = [...targets,'Den Haag','Amsterdam'].map((city,i) => sample({city,title:'Example, '+city,url:sample().url.replace('example','city-'+i)}));
+  rows.push(sample({city:'Leiden',rent:1001,url:sample().url.replace('example','over-budget')}));
+  rows.push(sample({city:'Rotterdam',status:'Available in lottery',url:sample().url.replace('example','lottery')}));
+  const baseline = core.reconcile(null,[],'multi','The Hague',1000,10).state;
+  const state = core.reconcile(baseline,rows,'multi',targets,1000,20).state;
+  assert.equal(Object.values(state.items).filter(x => x.pending).length,6);
+  assert.equal(Object.values(state.items).find(x => x.city==='Amsterdam').eligible,false);
+  assert.equal(Object.values(state.items).find(x => x.rent===1001).pending,null);
+  assert.equal(Object.values(state.items).find(x => x.status==='Available in lottery').pending,null);
 });
 test('two complete missing sweeps trigger reappearance, one transient disappearance does not', () => {
   const item = sample();
@@ -122,19 +139,28 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
 
 // Offline runtime harness: real DOM events/selectors, virtual clock and mocked GM APIs.
 // No network requests or page scripts from the uploaded HTML are executed.
-function harness({brokenSecondPage = false, blocked = false} = {}) {
+function harness({brokenSecondPage = false, blocked = false, selectedFilter = false, resetFails = false, initialCity = 'The Hague', outsideFirst = false} = {}) {
   const {document,window} = parseHTML(fixture);
   const card = document.querySelectorAll('.residence_block')[6].cloneNode(true);
   card.querySelector('.price_text').innerHTML = '€900.00<span class="excl">per month excl.*</span>';
+  card.querySelector('.residence_name').textContent = 'Example 1, ' + (outsideFirst ? 'Amsterdam' : initialCity);
   const second = card.cloneNode(true);
-  second.querySelector('.residence_name').textContent = 'Example 2, The Hague';
+  second.querySelector('.residence_name').textContent = 'Example 2, ' + initialCity;
   second.querySelector('a[href]').href = 'https://www.holland2stay.com/residences/example-2.html';
   const list = document.querySelector('.residence_MainSection');
   const pager = document.querySelector('.residence_pagination');
   document.querySelector('.total_residence .count').textContent = '2';
   const city = document.querySelector('[aria-label="Filter products by City"]');
-  city.insertAdjacentHTML('beforeend','<input title="The Hague" type="checkbox">');
-  city.querySelector('input').checked = true;
+  city.innerHTML = '<label>Rijswijk<input title="Rijswijk" type="checkbox"></label>';
+  city.querySelector('input').checked = selectedFilter;
+  const currentFilters = document.querySelector('[aria-label="Current Filters"]');
+  if (selectedFilter) currentFilters.innerHTML = '<li>Rijswijk</li>';
+  document.body.insertAdjacentHTML('beforeend','<div class="residenceFilter"><h2 class="filter_TabHeading"><span class="reset_text">Reset</span></h2></div>');
+  let resets = 0;
+  document.querySelector('.reset_text').addEventListener('click',() => {
+    resets++;
+    if (!resetFails) {currentFilters.innerHTML='';city.querySelector('input').checked=false;}
+  });
   const visited = [];
   function showPage(number) {
     visited.push(number);
@@ -167,7 +193,7 @@ function harness({brokenSecondPage = false, blocked = false} = {}) {
     GM_registerMenuCommand:(label,fn) => menus.set(label,fn),
     GM_xmlhttpRequest() {networkCalls++;throw Error('Unexpected real notification');}};
   vm.runInNewContext(source,sandbox,{filename:'h2s-monitor.user.js'});
-  return {document,storage,menus,intervals,visited,prefix,get networkCalls(){return networkCalls;}};
+  return {document,storage,menus,intervals,visited,prefix,second,get resets(){return resets;},get networkCalls(){return networkCalls;}};
 }
 async function drain() {for (let i = 0; i < 50; i++) await new Promise(resolve => setImmediate(resolve));}
 test('full userscript runtime traverses the actual pagination controls and stores a complete baseline', async () => {
@@ -197,4 +223,44 @@ test('full runtime pauses on a challenge and does not navigate or touch listing 
   assert.equal(app.storage.has(app.prefix + 'state'),false);
   assert.ok(app.storage.get(app.prefix + 'incident'));
   assert.equal(app.networkCalls,0);
+});
+test('runtime clears website filters once and scans all cities without selecting any city option', async () => {
+  const app = harness({selectedFilter:true});
+  await drain();
+  assert.equal(app.resets,1);
+  assert.ok(app.storage.get(app.prefix+'state')?.initialized);
+  assert.equal(core.filterState(app.document).ok,true);
+});
+test('failed Reset cannot create a partial baseline or cause repeated reset clicks', async () => {
+  const app = harness({selectedFilter:true,resetFails:true});
+  await drain();
+  assert.equal(app.resets,1);
+  assert.equal(app.storage.has(app.prefix+'state'),false);
+  assert.deepEqual(app.visited,[1]);
+});
+test('a city absent from the dynamic City options can appear later and generates a new listing alert', async () => {
+  const app = harness({initialCity:'Rijswijk'});
+  await drain();
+  const before = app.storage.get(app.prefix+'state');
+  assert.ok(before?.initialized);
+  assert.ok(Object.values(before.items).every(x => x.city==='Rijswijk'));
+  const url = 'https://www.holland2stay.com/residences/new-hague.html';
+  app.second.querySelector('.residence_name').textContent='New 1, The Hague';
+  app.second.querySelector('a[href]').href=url;
+  // The website still exposes only Rijswijk in its City filter; monitoring must work anyway.
+  const check = [...app.menus.entries()].find(([name]) => name.startsWith('立即检查'))[1];
+  check();await drain();
+  const after = app.storage.get(app.prefix+'state');
+  assert.equal(after.scope,before.scope);
+  assert.equal(after.items[url]?.pending?.reason,'新房源');
+  assert.equal(app.resets,0);
+});
+test('runtime scans unrelated cities but only tracks the requested five for notifications', async () => {
+  const app = harness({outsideFirst:true});
+  await drain();
+  const state = app.storage.get(app.prefix+'state');
+  assert.ok(state?.initialized);
+  assert.equal(Object.keys(state.items).length,1);
+  assert.equal(Object.values(state.items)[0].city,'The Hague');
+  assert.match(app.document.querySelector('#h2s-monitor-panel').textContent,/全站扫描 2 套/);
 });
