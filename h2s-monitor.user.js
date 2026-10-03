@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.0
+// @version      1.3.1
 // @description  Scan H2S by ascending rent, stop above budget, and notify for five allowed cities or one manually selected city.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -133,6 +133,10 @@
   function filterState(doc) {
     const root = doc.querySelector('.selected_filter [aria-label="Current Filters"]');
     if (!root) return {ok: false, city: '', cities: [], wanted: false, reason: '等待官网城市筛选加载'};
+    // H2S renders its Clear all filters action as a sibling <li> of the selected
+    // filters. It is a control, not an additional filter or a selected city.
+    const filterList = root.cloneNode(true);
+    filterList.querySelectorAll('.clear_filter,[data-cy="FilterSidebar-clearButton"]').forEach(node => node.remove());
     const nameOf = value => clean(value).replace(/\s*[×✕]\s*$/, '').replace(/\s+(?:remove|clear)(?:\s+filter)?$/i, '')
       .replace(/^city(?:\s*[:：-]\s*|\s+)/i, '').replace(/\s*\(\s*\d+\s*\)\s*$/, '').trim();
     const selected = input => input.checked === true || (typeof input.checked !== 'boolean' && input.hasAttribute('checked'));
@@ -144,7 +148,7 @@
     const checked = inputs.filter(selected);
     const checkedNames = checked.map(optionName).filter(Boolean);
     const options = new Set(inputs.map(optionName).filter(Boolean).map(cityKey));
-    const chips = [...root.children].map(node => {
+    const chips = [...filterList.children].map(node => {
       const copy = node.cloneNode(true);
       copy.querySelectorAll('svg,[aria-hidden="true"]').forEach(el => el.remove());
       copy.querySelectorAll('button,a,[role="button"]').forEach(el => {
@@ -162,11 +166,11 @@
     const otherChips = chips.some(name => !names.some(city => cityKey(city) === cityKey(name)));
     let reason = '';
     if (checked.length !== checkedNames.length) reason = '无法识别选中的城市名称；请展开 City 筛选';
-    else if (!names.length && !otherInputs && !text(root)) return {ok: true, city: '', cities: [], wanted: true, allCities: true, reason: ''};
+    else if (!names.length && !otherInputs && !text(filterList)) return {ok: true, city: '', cities: [], wanted: true, allCities: true, reason: ''};
     else if (!names.length) reason = '请手动清除其他网页筛选，或只保留一个 City';
     else if (names.length !== 1) reason = '一次只扫描一个城市；请只保留一个 City 选项';
     else if (!wanted) reason = '当前城市不在目标五城中，不开始扫描';
-    else if (otherInputs || otherChips || (text(root) && !chips.length)) reason = '请只保留当前 City，手动清除其他网页筛选';
+    else if (otherInputs || otherChips || (text(filterList) && !chips.length)) reason = '请只保留当前 City，手动清除其他网页筛选';
     return {ok: !reason, city, cities: names, wanted, reason};
   }
   function isAscendingPrice(value) {
@@ -504,6 +508,11 @@
     Object.assign(stats, {scope, sent: 0, scanned: 0, matched: 0, pages: 0});
     lastScope = scope;
     try {
+      while (manual && Date.now() < maintenanceUntil) {
+        assertScope(scope, manual, true);
+        setStatus('已开始，等待手动操作稳定', '还有约 ' + Math.ceil((maintenanceUntil - Date.now()) / 1000) + ' 秒，然后自动确认排序并扫描');
+        await sleep(Math.min(1000, maintenanceUntil - Date.now()));
+      }
       assertScope(scope, manual);
       await ensurePriceSort(scope, manual);
       setStatus('已开始，等待列表稳定', '按价格升序扫描，遇到主租金 > €' + MAX_RENT + ' 后停止翻页');

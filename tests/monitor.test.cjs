@@ -6,6 +6,7 @@ const vm = require('node:vm');
 const {parseHTML} = require('linkedom');
 const core = require('../h2s-monitor.user.js');
 const fixture = fs.readFileSync(__dirname + '/fixtures/residences.html', 'utf8');
+const selectedCityFixture = fs.readFileSync(__dirname + '/fixtures/the-hague-filters.html', 'utf8');
 const source = fs.readFileSync(__dirname + '/../h2s-monitor.user.js', 'utf8');
 const targets = ['The Hague','Rijswijk','Rotterdam','Leiden','Zoetermeer'];
 const documentOf = () => parseHTML(fixture).document;
@@ -59,6 +60,24 @@ test('recognizes global or one allowed city; rejects other cities, multiple citi
   assert.equal(core.filterState(doc).ok,false);
   selected.remove();
   assert.equal(core.filterState(doc).ok,false);
+});
+test('actual The Hague filter markup accepts the city and ignores the Clear all filters action', () => {
+  const {document} = parseHTML(selectedCityFixture);
+  assert.equal(document.querySelector('[data-cy="FilterSidebar-clearButton"]').textContent,'Clear all filters');
+  const filters = core.filterState(document);
+  assert.equal(filters.city,'The Hague');
+  assert.equal(filters.wanted,true);
+  assert.equal(filters.ok,true,filters.reason);
+  assert.equal(filters.reason,'');
+  document.querySelector('[aria-label="Filter products by City"]').remove();
+  assert.equal(core.filterState(document).ok,true,'Selected-city chip also works with collapsed/absent options');
+});
+test('ignoring Clear all filters still rejects genuine extra filters and multiple selected cities', () => {
+  for(const added of ['<li><span>Rent: €0–€900</span></li>','<li><span>Leiden</span></li>']){
+    const {document}=parseHTML(selectedCityFixture);
+    document.querySelector('[aria-label="Current Filters"]').insertAdjacentHTML('beforeend',added);
+    assert.equal(core.filterState(document).ok,false);
+  }
 });
 test('budget cutoff requires sorted prices, unique URLs, and a complete prefix or complete result', () => {
   const rows = [900,1500,1501].map((rent,i) => sample({rent,url:sample().url.replace('example','p'+i)}));
@@ -207,7 +226,7 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
 
 // Offline runtime harness: uploaded card markup, simulated site controls, virtual
 // clock, and mocked Telegram responses. No real network requests are made.
-function harness({pages, cityFilter = null, collapsedCity = false, extraFilter = false,
+function harness({pages, cityFilter = null, collapsedCity = false, extraFilter = false, actualCityControls = false,
   sortMode = 'asc', canSort = true, configured = false, blocked = false, brokenPage = 0,
   startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
   pages ||= [[sample()], [sample({rent:1000,url:sample().url.replace('example','second')})]];
@@ -228,6 +247,11 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
     cityRoot.innerHTML = collapsedCity ? '' : cities.map(city => '<label>'+city+'<input type="checkbox" title="'+city+'"></label>').join('');
     cityRoot.querySelectorAll('input').forEach(input => {input.checked=true;});
     filtersRoot.innerHTML = cities.map(city => '<li>City: '+city+' <button>×</button></li>').join('') + (extraFilter ? '<li>Rent: €0–€900</li>' : '');
+    if (actualCityControls && cities.length === 1 && cities[0] === 'The Hague') {
+      const uploaded = parseHTML(selectedCityFixture).document;
+      cityRoot.innerHTML = uploaded.querySelector('[aria-label="Filter products by City"]').innerHTML;
+      filtersRoot.innerHTML = uploaded.querySelector('[aria-label="Current Filters"]').innerHTML;
+    }
   }
   selectCity(cityFilter);
   document.querySelector('.total_residence .count').textContent = String(pages.flat().length);
@@ -389,6 +413,20 @@ test('nighttime manual scanning sends matches and repeated checks stay deduplica
   assert.equal(app.history,undefined);assert.equal(app.sortClicks,0);
   await check(app);assert.equal(app.messages.length,2);
   await check(app);assert.equal(app.messages.length,2);
+});
+test('nighttime check with real city controls waits for recent interaction then sorts and scans automatically',async()=>{
+  const app=harness({cityFilter:'The Hague',actualCityControls:true,sortMode:'unset',configured:true,startTime:'2026-10-03T22:00:00Z'});
+  await drain();
+  assert.equal(core.filterState(app.document).ok,true);
+  assert.equal(app.sortClicks,0);assert.equal(app.history,undefined);
+  app.manualClick(app.document.querySelector('[aria-label="Current Filters"]'));
+  await check(app);
+  assert.equal(app.sortClicks,1);assert.equal(app.messages.length,2);
+  assert.match(app.panel,/允许扫描：是/);
+  assert.match(app.panel,/价格排序：从低到高/);
+  assert.match(app.panel,/扫描状态：本轮已完成/);
+  assert.equal(app.resets,0);
+  assert.ok(app.document.querySelector('[data-cy="FilterSidebar-clearButton"]'));
 });
 test('same-scope user pagination during delivery does not interrupt a 31-message batch after six successes',async()=>{
   const app=harness({pages:[priced(Array(31).fill(900))],configured:true,
