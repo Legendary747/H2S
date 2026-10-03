@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.3
+// @version      1.3.4
 // @description  Scan H2S selected-city listings, use verified ascending rent for budget cutoff, and notify for five allowed cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -137,41 +137,58 @@
     // filters. It is a control, not an additional filter or a selected city.
     const filterList = root.cloneNode(true);
     filterList.querySelectorAll('.clear_filter,[data-cy="FilterSidebar-clearButton"]').forEach(node => node.remove());
-    const nameOf = value => clean(value).replace(/\s*[×✕]\s*$/, '').replace(/\s+(?:remove|clear)(?:\s+filter)?$/i, '')
-      .replace(/^city(?:\s*[:：-]\s*|\s+)/i, '').replace(/\s*\(\s*\d+\s*\)\s*$/, '').trim();
+    const nameOf = value => clean(value).replace(/^(?:apply|remove) filter\s+(.+)\.$/i, '$1')
+      .replace(/\s*[×✕]\s*$/, '').replace(/\s+(?:remove|clear)(?:\s+filter)?$/i, '')
+      .replace(/^(?:city|availability)(?:\s*[:：-]\s*|\s+)/i, '').replace(/\s*\(\s*\d+\s*\)\s*$/, '').trim();
     const selected = input => input.checked === true || (typeof input.checked !== 'boolean' && input.hasAttribute('checked'));
     const cityRoot = doc.querySelector('[aria-label="Filter products by City"]');
+    const availabilityRoot = doc.querySelector('[aria-label="Filter products by Availability"]');
     const inputs = [...(cityRoot?.querySelectorAll('input[type="checkbox"],input[type="radio"]') || [])];
+    const availabilityInputs = [...(availabilityRoot?.querySelectorAll('input[type="checkbox"],input[type="radio"]') || [])];
     const optionName = input => nameOf(input.getAttribute('title') || input.getAttribute('aria-label') ||
       text(input.closest('label')) || (input.id && text([...doc.querySelectorAll('label')].find(label => label.htmlFor === input.id))) ||
       (/^[a-z]/i.test(input.value || '') && input.value !== 'on' ? input.value : ''));
     const checked = inputs.filter(selected);
     const checkedNames = checked.map(optionName).filter(Boolean);
     const options = new Set(inputs.map(optionName).filter(Boolean).map(cityKey));
+    const availabilityName = name => directStatus(name) ? 'Available to book'
+      : /^available in lottery$/i.test(name) ? 'Available in lottery' : /^occupied$/i.test(name) ? 'Occupied' : '';
     const chips = [...filterList.children].map(node => {
       const copy = node.cloneNode(true);
       copy.querySelectorAll('svg,[aria-hidden="true"]').forEach(el => el.remove());
       copy.querySelectorAll('button,a,[role="button"]').forEach(el => {
         if (/^(?:[×✕x]|remove|clear)?$/i.test(text(el))) el.remove();
       });
-      return nameOf(text(copy));
-    }).filter(Boolean);
-    const recognized = chips.filter(name => matchesCity(name, TARGET_CITIES) || options.has(cityKey(name)));
-    const names = [...new Map((checkedNames.length ? checkedNames : recognized.length ? recognized : chips)
+      const label = text(copy);
+      const name = nameOf(label);
+      // Chips share one list, but their meanings do not. Only positive City
+      // evidence makes a city; never reinterpret unknown filters as city names.
+      const kind = availabilityName(name) || /^availability(?:\s*[:：-]|\s+)/i.test(label) ? 'availability'
+        : /^city(?:\s*[:：-]|\s+)/i.test(label) || matchesCity(name, TARGET_CITIES) || options.has(cityKey(name)) ? 'city' : 'other';
+      return {name, kind};
+    }).filter(chip => chip.name);
+    const names = [...new Map([...checkedNames, ...chips.filter(chip => chip.kind === 'city').map(chip => chip.name)]
       .map(name => [cityKey(name), name])).values()];
+    const checkedAvailability = availabilityInputs.filter(selected);
+    const checkedAvailabilityNames = checkedAvailability.map(optionName).filter(Boolean);
+    const availabilityNames = [...new Set([...checkedAvailabilityNames, ...chips.filter(chip => chip.kind === 'availability').map(chip => chip.name)]
+      .map(name => availabilityName(name) || name))];
+    const availability = availabilityNames.join(', ');
     const city = names.length === 1 ? names[0] : '';
-    const wanted = names.length > 0 && names.every(name => matchesCity(name, TARGET_CITIES));
+    const allCities = names.length === 0;
+    const wanted = allCities || names.every(name => matchesCity(name, TARGET_CITIES));
     const otherInputs = [...doc.querySelectorAll('[aria-label^="Filter products by "] input[type="checkbox"], [aria-label^="Filter products by "] input[type="radio"]')]
-      .some(input => selected(input) && !cityRoot?.contains(input));
-    const otherChips = chips.some(name => !names.some(city => cityKey(city) === cityKey(name)));
+      .some(input => selected(input) && !cityRoot?.contains(input) && !availabilityRoot?.contains(input));
+    const otherChips = chips.filter(chip => chip.kind === 'other');
     let reason = '';
     if (checked.length !== checkedNames.length) reason = '无法识别选中的城市名称；请展开 City 筛选';
-    else if (!names.length && !otherInputs && !text(filterList)) return {ok: true, city: '', cities: [], wanted: true, allCities: true, reason: ''};
-    else if (!names.length) reason = '请手动清除其他网页筛选，或只保留一个 City';
-    else if (names.length !== 1) reason = '一次只扫描一个城市；请只保留一个 City 选项';
+    else if (names.length > 1) reason = '一次只扫描一个城市；请只保留一个 City 选项';
     else if (!wanted) reason = '当前城市不在目标五城中，不开始扫描';
-    else if (otherInputs || otherChips || (text(filterList) && !chips.length)) reason = '请只保留当前 City，手动清除其他网页筛选';
-    return {ok: !reason, city, cities: names, wanted, reason};
+    else if (checkedAvailability.length !== checkedAvailabilityNames.length) reason = '无法识别可订状态；请展开 Availability 筛选';
+    else if (availabilityNames.length > 1 || (availability && availability !== 'Available to book')) reason = 'Availability 请只选择 Available to book，或清除可订状态筛选';
+    else if (otherInputs || otherChips.length || (text(filterList) && !chips.length)) reason = '请清除其他网页筛选；可保留一个目标 City 和 Available to book'
+      + (otherChips.length ? '；未支持的筛选：' + otherChips.map(chip => chip.name).join(', ') : '');
+    return {ok: !reason, city, cities: names, wanted, allCities, availability, reason};
   }
   function isAscendingPrice(value) {
     const label = clean(value);
@@ -321,7 +338,8 @@
   function configured() { return Boolean(get('token', '') && get('chatId', '')); }
   const readHistory = () => historyFrom(get('state', null));
   const targetsFor = filters => filters.allCities ? TARGET_CITIES : filters.city ? [filters.city] : [];
-  const scopeFor = filters => JSON.stringify(['price-asc-v1', filters.allCities ? '*' : cityKey(filters.city), MAX_RENT]);
+  const scopeFor = filters => JSON.stringify(['price-asc-v1', filters.allCities ? '*' : cityKey(filters.city), MAX_RENT,
+    ...(filters.availability ? ['availability:' + filters.availability] : [])]);
   const queuedItems = (history, filters) => Object.values(history.cities).flatMap(state => Object.values(state.items))
     .filter(item => item.pending && item.eligible && !item.missing && item.rent <= MAX_RENT && matchesCity(item.city, targetsFor(filters)));
   function render() {
@@ -335,6 +353,7 @@
     const mode = sameScope ? stats.mode : previous?.mode;
     panel.textContent = ['H2S · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
       '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
+      '可订状态：' + (filters.availability || '未筛选（仅通知可直接预订）'),
       '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
       '允许扫描：' + (filters.ok ? '是' : '否；' + filters.reason),
       '价格排序：' + (mode === 'single' ? '当前仅一页，无需排序' : sorting.ok ? '从低到高' : sorting.selected ? '已选择 Price，升序方向未确认' : '尚未确认升序'),
@@ -412,8 +431,10 @@
       try {
         if (priceSortState(document).root?.getAttribute('aria-busy') === 'true') throw Error('等待排序加载');
         const result = parsePage(document);
-        const selectedCity = filterState(document).city;
+        const currentFilters = filterState(document);
+        const selectedCity = currentFilters.city;
         if (selectedCity && result.listings.some(item => !matchesCity(item.city, selectedCity))) throw Error('等待列表切换到所选城市');
+        if (currentFilters.availability === 'Available to book' && result.listings.some(item => !directStatus(item.status))) throw Error('等待列表切换到 Available to book');
         if (requireAscending && result.listings.some((item, index) => index && item.rent < result.listings[index - 1].rent)) throw Error('等待价格升序生效');
         const signature = fingerprint(result);
         const correctPage = !expectedPage || result.page.current === expectedPage;

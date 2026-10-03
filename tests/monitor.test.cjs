@@ -9,6 +9,7 @@ const fixture = fs.readFileSync(__dirname + '/fixtures/residences.html', 'utf8')
 const selectedCityFixture = fs.readFileSync(__dirname + '/fixtures/the-hague-filters.html', 'utf8');
 const selectedCityPage = fs.readFileSync(__dirname + '/fixtures/the-hague-listings.html', 'utf8');
 const actualSortMenu = fs.readFileSync(__dirname + '/fixtures/sort-menu.html', 'utf8');
+const availabilityFixture = fs.readFileSync(__dirname + '/fixtures/availability-filters.html', 'utf8');
 const source = fs.readFileSync(__dirname + '/../h2s-monitor.user.js', 'utf8');
 const targets = ['The Hague','Rijswijk','Rotterdam','Leiden','Zoetermeer'];
 const documentOf = () => parseHTML(fixture).document;
@@ -55,7 +56,7 @@ test('recognizes global or one allowed city; rejects other cities, multiple citi
   assert.equal(core.filterState(doc).ok,true);
   selected.innerHTML += '<li>Leiden</li>';
   assert.equal(core.filterState(doc).ok,false);
-  selected.innerHTML = '<li>Amsterdam</li>';
+  selected.innerHTML = '<li>City: Amsterdam</li>';
   assert.equal(core.filterState(doc).city,'Amsterdam');
   assert.equal(core.filterState(doc).wanted,false);
   selected.innerHTML = '<li>Rent p/month: €0–€900</li>';
@@ -80,6 +81,44 @@ test('ignoring Clear all filters still rejects genuine extra filters and multipl
     document.querySelector('[aria-label="Current Filters"]').insertAdjacentHTML('beforeend',added);
     assert.equal(core.filterState(document).ok,false);
   }
+});
+test('Availability labels never become cities, including with collapsed or absent filter options', () => {
+  for(const collapsed of [false,true]){
+    const {document}=parseHTML(availabilityFixture);
+    if(collapsed) document.querySelector('[aria-label="Filter products by Availability"]').remove();
+    const state=core.filterState(document);
+    assert.equal(state.ok,true,state.reason);assert.equal(state.city,'');assert.deepEqual(state.cities,[]);
+    assert.equal(state.allCities,true);assert.equal(state.availability,'Available to book');
+  }
+});
+test('selected City and Available to book combine while unsupported availability and unknown chips stay separate', () => {
+  const {document}=parseHTML(availabilityFixture);
+  const selected=document.querySelector('[aria-label="Current Filters"]');
+  selected.insertAdjacentHTML('afterbegin','<li><span>The Hague</span></li>');
+  assert.equal(core.filterState(document).ok,true);
+  assert.equal(core.filterState(document).city,'The Hague');
+  assert.equal(core.filterState(document).availability,'Available to book');
+  for(const name of ['Available in lottery','Occupied','Furnished','1 bedroom','Rent: €0–€900','Unrecognized label']){
+    const {document:other}=parseHTML(availabilityFixture);
+    other.querySelector('[aria-label="Filter products by Availability"]').remove();
+    other.querySelector('[aria-label="Current Filters"]').innerHTML='<li><span>'+name+'</span></li>';
+    const state=core.filterState(other);
+    assert.equal(state.ok,false,name);assert.equal(state.city,'',name);assert.deepEqual(state.cities,[],name);
+    assert.doesNotMatch(state.reason,/当前城市不在目标五城/,name);
+  }
+  selected.insertAdjacentHTML('beforeend','<li>Furnished</li>');
+  assert.equal(core.filterState(document).ok,false,'Bookable availability does not hide other filters');
+});
+test('filter parsing uses category evidence and refuses mixed availability or inconsistent city selections', () => {
+  const {document}=parseHTML(availabilityFixture);
+  const lottery=document.querySelector('input[title="Available in lottery"]');
+  lottery.setAttribute('checked','');
+  assert.equal(core.filterState(document).ok,false);
+  assert.equal(core.filterState(document).city,'');
+  lottery.removeAttribute('checked');
+  document.querySelector('[aria-label="Filter products by City"]').innerHTML='<label>The Hague<input type="checkbox" checked title="The Hague"></label>';
+  document.querySelector('[aria-label="Current Filters"]').insertAdjacentHTML('beforeend','<li>Leiden</li>');
+  assert.equal(core.filterState(document).ok,false,'Stale chip and checkbox must not silently choose one city');
 });
 test('budget cutoff requires sorted prices, unique URLs, and a complete prefix or complete result', () => {
   const rows = [900,1500,1501].map((rent,i) => sample({rent,url:sample().url.replace('example','p'+i)}));
@@ -265,7 +304,8 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
 // clock, and mocked Telegram responses. No real network requests are made.
 function harness({pages, cityFilter = null, collapsedCity = false, extraFilter = false, actualCityControls = false,
   sortMode = 'asc', sortOptionLabel = 'Price: Low to High', sortOptionTag = 'button', canSort = true, configured = false, blocked = false, brokenPage = 0,
-  actualSortControls = false, sortMenuOpen = false, startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
+  actualSortControls = false, sortMenuOpen = false, availability = null, collapsedAvailability = false,
+  startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
   pages ||= [[sample()], [sample({rent:1000,url:sample().url.replace('example','second')})]];
   const {document,window} = parseHTML(fixture);
   const template = document.querySelectorAll('.residence_block')[6].cloneNode(true);
@@ -291,6 +331,27 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
     }
   }
   selectCity(cityFilter);
+  let availabilityRoot=document.querySelector('[aria-label="Filter products by Availability"]');
+  if(!availabilityRoot){
+    availabilityRoot=parseHTML(availabilityFixture).document.querySelector('[aria-label="Filter products by Availability"]').cloneNode(true);
+    document.body.append(availabilityRoot);
+  }
+  function selectAvailability(value){
+    const names=value===null?[]:Array.isArray(value)?value:[value];
+    const controls=parseHTML(availabilityFixture).document;
+    availabilityRoot.innerHTML=collapsedAvailability?'':controls.querySelector('[aria-label="Filter products by Availability"]').innerHTML;
+    for(const input of availabilityRoot.querySelectorAll('input')){
+      input.checked=names.includes(input.getAttribute('title'));
+      if(input.checked)input.setAttribute('checked','');else input.removeAttribute('checked');
+    }
+    filtersRoot.querySelectorAll('[data-test-availability]').forEach(node=>node.remove());
+    for(const name of names){
+      const chip=controls.querySelector('[aria-label="Current Filters"] li').cloneNode(true);
+      chip.setAttribute('data-test-availability','');chip.querySelector('span').textContent=name;
+      filtersRoot.append(chip);
+    }
+  }
+  selectAvailability(availability);
   document.querySelector('.total_residence .count').textContent = String(pages.flat().length);
   let resets = 0;
   document.body.insertAdjacentHTML('beforeend','<div class="residenceFilter"><span class="reset_text">Reset</span></div>');
@@ -342,7 +403,7 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
       '<li><a aria-label="Next page" aria-disabled="'+(number===pages.length)+'">Next</a></li>';
     pager.querySelectorAll('[aria-label^="Page "]').forEach(link => link.addEventListener('click',() => showPage(Number(link.textContent))));
     pager.querySelector('[aria-label="Next page"]').addEventListener('click',() => {if(number<pages.length) showPage(number+1);});
-    if (visited.length>1) onPage?.({number,document,selectCity});
+    if (visited.length>1) onPage?.({number,document,selectCity,selectAvailability});
   }
   showPage(1);
   if (blocked) document.title='Just a moment...';
@@ -366,7 +427,7 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
       if(!configured) throw Error('Unexpected notification');
       const attempt=networkCalls, body=JSON.parse(request.data);
       queueMicrotask(()=>{
-        const response=onRequest?.({attempt,body,document,selectCity,manualClick});
+        const response=onRequest?.({attempt,body,document,selectCity,selectAvailability,manualClick});
         if(response==='error'){request.onerror();return;}
         if(response==='429'){request.onload({status:429,responseText:JSON.stringify({ok:false,parameters:{retry_after:60}})});return;}
         messages.push(body);
@@ -374,7 +435,7 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
       });
     }};
   vm.runInNewContext(source,sandbox,{filename:'h2s-monitor.user.js'});
-  return {document,storage,menus,intervals,visited,prefix,messages,selectCity,manualClick,
+  return {document,storage,menus,intervals,visited,prefix,messages,selectCity,selectAvailability,manualClick,
     advance:ms=>{clock+=ms;},tick:()=>intervals[0](),
     get history(){return storage.get(prefix+'state');},get panel(){return document.querySelector('#h2s-monitor-panel').textContent;},
     get resets(){return resets;},get sortClicks(){return sortClicks;},get sortOptionClicks(){return sortOptionClicks;},get networkCalls(){return networkCalls;},get reloads(){return reloads;}};
@@ -393,6 +454,30 @@ test('global runtime scans sorted pages and retains initial notifications until 
   assert.match(app.panel,/当前城市：全部城市/);
   assert.match(app.panel,/当前范围待发 2/);
   await check(app);assert.deepEqual(app.visited,[1,2,1,2]);
+});
+test('Availability-only and City-plus-Availability scans show the correct fields and preserve notification deduplication',async()=>{
+  for(const cityFilter of [null,'The Hague']){
+    const app=harness({cityFilter,availability:'Available to book',collapsedAvailability:true,configured:true});await drain();
+    assert.equal(app.messages.length,2,app.panel);
+    assert.match(app.panel,cityFilter?/当前城市：The Hague/:/当前城市：全部城市/);
+    assert.match(app.panel,/可订状态：Available to book/);assert.doesNotMatch(app.panel,/当前城市：Available to book/);
+    const unfiltered=harness({cityFilter,configured:true,initialState:app.history});await drain();
+    assert.equal(unfiltered.messages.length,0);assert.equal(unfiltered.history.sent,2);
+  }
+});
+test('Availability changes during pagination cancel the scan; stale lottery cards cannot complete a bookable scan',async()=>{
+  const changed=harness({cityFilter:'The Hague',onPage:({number,selectAvailability})=>{if(number===2)selectAvailability('Available to book');}});
+  await drain();assert.equal(changed.history,undefined);assert.match(changed.panel,/筛选条件已改变/);
+  const stale=harness({cityFilter:'The Hague',availability:'Available to book',pages:[[sample({status:'Lottery'})]],configured:true});
+  await drain();assert.equal(stale.history,undefined);assert.equal(stale.messages.length,0);
+  assert.match(stale.panel,/等待列表切换到 Available to book/);
+});
+test('Availability-only global Price mode reports its sorting limitation instead of inventing a city',async()=>{
+  const app=harness({availability:'Available to book',sortMode:'price',configured:true});await drain();
+  assert.equal(app.history,undefined);assert.equal(app.messages.length,0);
+  assert.match(app.panel,/当前城市：全部城市/);assert.match(app.panel,/可订状态：Available to book/);
+  assert.match(app.panel,/官网只显示 Price/);assert.doesNotMatch(app.panel,/当前城市不在目标五城/);
+  assert.deepEqual(app.visited,[1]);
 });
 test('sort selection uses the observed ProductSort control and verifies the ascending label',async()=>{
   const app=harness({sortMode:'unset',configured:true});await drain();
