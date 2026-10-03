@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.1
-// @description  Scan H2S by ascending rent, stop above budget, and notify for five allowed cities or one manually selected city.
+// @version      1.3.2
+// @description  Scan H2S selected-city listings, use verified ascending rent for budget cutoff, and notify for five allowed cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
 // @grant        GM_getValue
@@ -179,13 +179,19 @@
       /\blow(?:est)?\s*(?:to|[-–→])\s*high(?:est)?\b|\basc(?:ending)?\b|laag.*hoog|oplopend|↑/i.test(label) &&
       !/\bhigh(?:est)?\s*(?:to|[-–→])\s*low(?:est)?\b|\bdesc(?:ending)?\b/i.test(label);
   }
+  function isPriceChoice(value) {
+    const label = clean(String(value || '').replace(/[✓✔]/g, ''));
+    return /^(?:price|rent|prijs)$/i.test(label) || isAscendingPrice(label);
+  }
   function priceSortState(doc) {
     const root = doc.querySelector('[data-cy="ProductSort-root"]');
     const button = root?.querySelector('[data-cy="ProductSort-sortButton"]');
     const chosen = root?.querySelector('[aria-selected="true"],[aria-checked="true"],input:checked');
-    const ok = root?.getAttribute('aria-busy') !== 'true' && (isAscendingPrice(text(button)) ||
-      (chosen && isAscendingPrice(text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label'))));
-    return {ok: Boolean(ok), button, root};
+    const labels = [text(button), chosen && (text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label'))];
+    const ready = root?.getAttribute('aria-busy') !== 'true';
+    // The actual menu says only "Price". That is a selected price sort, but does
+    // not prove global ascending main-rent order (availability may be grouped).
+    return {ok: ready && labels.some(isAscendingPrice), selected: ready && labels.some(isPriceChoice), button, root};
   }
   function challenge(doc) {
     // A normal embedded Turnstile widget or the word "Cloudflare" is NOT a challenge page.
@@ -279,7 +285,7 @@
   // The userscript is also directly importable by the offline regression tests.
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {cityKey, cityKeys, matchesCity, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
-      filterState, isAscendingPrice, priceSortState, challenge, withinHours, validateSweep, validateBudgetSweep,
+      filterState, isAscendingPrice, isPriceChoice, priceSortState, challenge, withinHours, validateSweep, validateBudgetSweep,
       cityScope, historyFrom, freshState, reconcile, deliverPending};
     return;
   }
@@ -302,7 +308,7 @@
   let retryNoticeAt = 0;
   let daytime = withinHours();
   let maintenanceUntil = 0;
-  const stats = {message: '正在启动', phase: '未开始', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
+  const stats = {message: '正在启动', phase: '未开始', mode: '', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
   const panel = document.createElement('aside');
   panel.id = 'h2s-monitor-panel';
   Object.assign(panel.style, {position: 'fixed', right: '16px', bottom: '84px', zIndex: '2147483646', padding: '14px 16px',
@@ -322,11 +328,14 @@
     const previous = filters.ok ? history.scans?.[scopeFor(filters)] : null;
     const pending = filters.ok ? queuedItems(history, filters).length : 0;
     const others = Object.values(history.cities).flatMap(state => Object.values(state.items)).filter(item => item.pending && item.eligible && !item.missing).length - pending;
+    const sorting = priceSortState(document);
+    const mode = sameScope ? stats.mode : previous?.mode;
     panel.textContent = ['H2S · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
       '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
       '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
       '允许扫描：' + (filters.ok ? '是' : '否；' + filters.reason),
-      '价格排序：' + (priceSortState(document).ok ? '从低到高' : '尚未确认升序'),
+      '价格排序：' + (mode === 'single' ? '当前仅一页，无需排序' : sorting.ok ? '从低到高' : sorting.selected ? '已选择 Price，升序方向未确认' : '尚未确认升序'),
+      ...(mode === 'city' ? ['扫描方式：读完当前城市全部页，再按预算筛选'] : []),
       '扫描状态：' + (isLeader ? stats.phase : '待机，另一个标签页正在监控'), stats.message,
       '已读 ' + (sameScope ? stats.scanned : previous?.inspected || 0) + ' 套 · 符合 ' + (sameScope ? stats.matched : previous?.matched || 0) + ' 套 · 第 ' + (sameScope ? stats.pages : previous?.pages || 0) + ' 页',
       '本轮已发 ' + (sameScope ? stats.sent : 0) + ' · 当前范围待发 ' + pending + ' · 累计 ' + history.sent,
@@ -355,45 +364,50 @@
     if (!filters.ok) throw Error(filters.reason);
     if (filtersFingerprint() !== scope) throw Error('筛选条件已改变；本轮已取消');
   }
-  function assertAllowed(scope, manual) {
+  function assertAllowed(scope, manual, requireAscending = false) {
     assertScope(scope, manual);
-    if (!priceSortState(document).ok) throw Error('价格排序发生变化；请使用 Price: low to high');
+    if (requireAscending && !priceSortState(document).ok) throw Error('升序排序发生变化；本轮预算截断扫描已取消');
   }
   async function ensurePriceSort(scope, manual) {
-    if (priceSortState(document).ok) return;
     const initial = priceSortState(document);
-    if (!initial.button) throw Error('未找到官网 Sort 控件，请手动选择价格从低到高');
-    setStatus('准备排序', '正在选择 Price: low to high');
-    initial.button.click();
+    if (initial.selected || !initial.button) return initial;
+    setStatus('准备排序', '正在选择官网 Price 价格排序');
+    const findOption = sorting => {
+      const candidates = [...(sorting.root?.querySelectorAll('button,a,[role="option"],[role="menuitem"],label,li,div,span') || []),
+        ...document.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]')]
+        .filter(node => node !== sorting.button && !sorting.button?.contains(node) &&
+          !node.closest('[hidden],[aria-hidden="true"]') && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true');
+      return candidates.find(node => isAscendingPrice(text(node))) || candidates.find(node => isPriceChoice(text(node)));
+    };
+    if (!findOption(initial)) initial.button.click();
     const start = Date.now();
     let chosen = false;
     while (Date.now() - start < MAX_SETTLE_MS) {
       assertScope(scope, manual);
       const sorting = priceSortState(document);
-      if (sorting.ok) return;
+      if (sorting.selected) return sorting;
       if (!chosen) {
-        const candidates = [...(sorting.root?.querySelectorAll('button,a,[role="option"],[role="menuitem"],label') || []),
-          ...document.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]')];
-        const option = candidates.find(node => node !== sorting.button && isAscendingPrice(text(node)));
+        const option = findOption(sorting);
         if (option) { option.click(); chosen = true; }
       }
       await sleep(500);
     }
-    throw Error('未能确认升序排序；请在官网 Sort 中手动选择 Price: low to high 后立即检查');
+    return priceSortState(document);
   }
   function fingerprint(result) {
     return JSON.stringify([result.total, result.page.current, result.page.last, result.listings.map(item => [item.url, item.rent, item.status])]);
   }
-  async function stablePage(scope, manual, expectedPage, oldSignature = null) {
+  async function stablePage(scope, manual, expectedPage, oldSignature = null, requireAscending = false) {
     const start = Date.now();
     let previous = null, stable = 0, lastError = '等待房源加载';
     while (Date.now() - start <= MAX_SETTLE_MS) {
-      assertAllowed(scope, manual);
+      assertAllowed(scope, manual, requireAscending);
       try {
+        if (priceSortState(document).root?.getAttribute('aria-busy') === 'true') throw Error('等待排序加载');
         const result = parsePage(document);
         const selectedCity = filterState(document).city;
         if (selectedCity && result.listings.some(item => !matchesCity(item.city, selectedCity))) throw Error('等待列表切换到所选城市');
-        if (result.listings.some((item, index) => index && item.rent < result.listings[index - 1].rent)) throw Error('等待价格升序生效');
+        if (requireAscending && result.listings.some((item, index) => index && item.rent < result.listings[index - 1].rent)) throw Error('等待价格升序生效');
         const signature = fingerprint(result);
         const correctPage = !expectedPage || result.page.current === expectedPage;
         const changed = oldSignature === null || signature !== oldSignature;
@@ -505,43 +519,60 @@
     deliveryContext = null;
     const scope = scopeFor(filters);
     const targets = targetsFor(filters);
-    Object.assign(stats, {scope, sent: 0, scanned: 0, matched: 0, pages: 0});
+    Object.assign(stats, {scope, mode: '', sent: 0, scanned: 0, matched: 0, pages: 0});
     lastScope = scope;
     try {
       while (manual && Date.now() < maintenanceUntil) {
         assertScope(scope, manual, true);
-        setStatus('已开始，等待手动操作稳定', '还有约 ' + Math.ceil((maintenanceUntil - Date.now()) / 1000) + ' 秒，然后自动确认排序并扫描');
+        setStatus('已开始，等待手动操作稳定', '还有约 ' + Math.ceil((maintenanceUntil - Date.now()) / 1000) + ' 秒，然后自动扫描');
         await sleep(Math.min(1000, maintenanceUntil - Date.now()));
       }
       assertScope(scope, manual);
-      await ensurePriceSort(scope, manual);
-      setStatus('已开始，等待列表稳定', '按价格升序扫描，遇到主租金 > €' + MAX_RENT + ' 后停止翻页');
+      setStatus('已开始，等待列表稳定', '正在确认当前城市、房源数量和分页');
       let result = await stablePage(scope, manual);
+      const singlePage = page => page.page.current === 1 && page.page.last === 1 && !page.page.next;
+      let mode = 'single';
+      if (!singlePage(result)) {
+        const sorting = await ensurePriceSort(scope, manual);
+        if (!sorting.ok && filters.allCities) {
+          throw Error((sorting.selected ? '官网只显示 Price，无法确认整份列表按主租金升序' : '未能确认升序排序') +
+            '；请手动选择一个目标城市后立即检查');
+        }
+        mode = sorting.ok ? 'budget' : 'city';
+        setStatus('已开始，等待列表稳定', mode === 'budget' ? '已确认升序，遇到主租金 > €' + MAX_RENT + ' 后停止翻页'
+          : '未确认升序，将读取 ' + filters.city + ' 的全部页，再按预算筛选');
+        result = await stablePage(scope, manual, undefined, null, mode === 'budget');
+        if (singlePage(result)) mode = 'single';
+      }
+      stats.mode = mode;
+      const useCutoff = mode === 'budget';
       if (result.page.current !== 1) {
         if (!result.page.first) throw Error('找不到第 1 页，无法确认预算内房源完整');
         const old = fingerprint(result);
         result.page.first.click();
-        result = await stablePage(scope, manual, 1, old);
+        result = await stablePage(scope, manual, 1, old, useCutoff);
       }
       const total = result.total;
       const listings = [];
       for (let n = 1; n <= MAX_PAGES; n++) {
-        assertAllowed(scope, manual);
+        assertAllowed(scope, manual, useCutoff);
         if (result.total !== total || result.page.current !== n) throw Error('分页期间结果总数或页码变化；本轮不更新历史');
-        if (listings.length && result.listings.length && result.listings[0].rent < listings[listings.length - 1].rent) throw Error('跨页价格未按升序排列；本轮不更新历史');
+        if (useCutoff && listings.length && result.listings.length && result.listings[0].rent < listings[listings.length - 1].rent) throw Error('跨页价格未按升序排列；本轮不更新历史');
         listings.push(...result.listings);
         stats.scanned = listings.length;
         stats.matched = listings.filter(item => matchesCity(item.city, targets) && item.rent <= MAX_RENT && directStatus(item.status)).length;
         stats.pages = n;
         setStatus('扫描中', '正在读取第 ' + n + ' 页；当前列表共 ' + total + ' 套');
-        if (result.listings.some(item => item.rent > MAX_RENT) || !result.page.next) break;
+        if ((useCutoff && result.listings.some(item => item.rent > MAX_RENT)) || !result.page.next) break;
         if (n === MAX_PAGES) throw Error('超过分页上限；本轮不更新历史');
         const old = fingerprint(result);
         result.page.next.click();
-        result = await stablePage(scope, manual, n + 1, old);
+        result = await stablePage(scope, manual, n + 1, old, useCutoff);
       }
-      const {cutoff} = validateBudgetSweep(listings, total, MAX_RENT, filters.city, !result.page.next);
-      assertAllowed(scope, manual);
+      let cutoff = false;
+      if (useCutoff) ({cutoff} = validateBudgetSweep(listings, total, MAX_RENT, filters.city, !result.page.next));
+      else validateSweep(listings, total, filters.city);
+      assertAllowed(scope, manual, useCutoff);
       const history = readHistory();
       const requested = name => get(name, false) === true || get(name, false) === scope;
       const notifyExisting = requested('notifyExisting');
@@ -557,12 +588,13 @@
         history.cities[key] = state;
       }
       history.scans ||= {};
-      history.scans[scope] = {completedAt: Date.now(), inspected: listings.length, matched: stats.matched, pages: stats.pages, total, cutoff};
+      history.scans[scope] = {completedAt: Date.now(), inspected: listings.length, matched: stats.matched, pages: stats.pages, total, cutoff, mode};
       set('state', history);
       if (notifyExisting) set('notifyExisting', false);
       if (silentBaseline) set('silentBaseline', false);
       const completion = silentBaseline ? '已按选择建立静默记录；现有房源不通知'
-        : cutoff ? '已到超预算位置，停止翻页；预算内扫描完成' : '已读到末页；预算内扫描完成';
+        : cutoff ? '已到超预算位置，停止翻页；预算内扫描完成'
+          : mode === 'single' ? '单页房源已完整读取；预算内扫描完成' : '已读到末页；预算内扫描完成';
       setStatus('扫描已完成', completion);
       if (queuedItems(history, filters).length) {
         deliveryContext = {scope, manual, expiresAt: Date.now() + 15 * 60000};
