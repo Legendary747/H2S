@@ -713,6 +713,7 @@ test('02:09 Amsterdam: idle means night pause; the panel button starts a full ma
   assert.equal(app.sortOptionClicks,1);assert.equal(app.sortClicks,2,'reopens the closed menu to verify selection');
   assert.equal(app.messages.length,2);assert.match(app.panel,/本轮已完成/);assert.match(app.panel,/下次刷新 —/);
   button.click();await drain();assert.equal(app.messages.length,2,'panel checks preserve successful deduplication');
+  assert.match(app.panel,/符合房源已通知过；本轮没有需要新发的通知/);
 });
 test('initial list settling is distinct from selecting Price and disables duplicate starts',async()=>{
   const app=harness({sortMode:'unset',configured:true});
@@ -850,11 +851,15 @@ test('old all-city records migrate on upgrade, send pending only, and preserve p
 });
 test('silent reset and forced resend apply only to the current scope and later scans still deduplicate',async()=>{
   const app=harness({cityFilter:'The Hague',configured:true});await drain();assert.equal(app.messages.length,2);
-  app.menus.get('清除历史并重建基线（不通知现有房源）')();await drain();await check(app);
+  app.menus.get('清除历史并重建基线（不通知现有房源）')();await drain();
+  assert.match(app.panel,/已设置静默基线/);await check(app);
   assert.equal(app.messages.length,2);assert.match(app.panel,/静默记录/);
+  assert.match(app.panel,/静默基线中的房源不首发/);
   await check(app);assert.equal(app.messages.length,2);
-  app.menus.get('重新通知当前符合条件的房源（强制重发）')();await drain();await check(app);
+  app.menus.get('重新通知当前符合条件的房源（强制重发）')();await drain();
+  assert.match(app.panel,/已设置强制重发/);await check(app);
   assert.equal(app.messages.length,4);await check(app);assert.equal(app.messages.length,4);
+  assert.match(app.panel,/符合房源已通知过；本轮没有需要新发的通知/);
 });
 test('challenge pages pause without sorting, pagination, or altering listing history',async()=>{
   const app=harness({blocked:true});await drain();assert.equal(app.history,undefined);

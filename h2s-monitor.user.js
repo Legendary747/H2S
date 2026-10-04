@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.8
+// @version      1.3.9
 // @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -411,19 +411,43 @@
   let daytime = withinHours();
   let maintenanceUntil = 0;
   const stats = {message: '正在启动', phase: '未开始', sortStep: '', mode: '', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
+  const panelColors = {normal: '#e6edf5', muted: '#a6b8cb', info: '#7dd3fc', success: '#86efac', warning: '#fcd34d', error: '#fda4af'};
+  const panelBackgrounds = {normal: '#162638', muted: '#162638', info: '#142d41', success: '#16332f', warning: '#352d20', error: '#38232e'};
+  function panelNode(tag, value, style = {}) {
+    const node = document.createElement(tag);
+    if (value != null) node.textContent = value;
+    Object.assign(node.style, style);
+    return node;
+  }
+  function panelRow(label, value, tone = 'normal') {
+    const row = panelNode('div', null, {display: 'flex', gap: '8px', alignItems: 'baseline', margin: '5px 0'});
+    row.append(panelNode('span', label + '：', {color: panelColors.muted, flex: '0 0 68px'}),
+      panelNode('span', value, {color: panelColors[tone], flex: '1', minWidth: '0', overflowWrap: 'anywhere'}));
+    return row;
+  }
+  function panelNumbers(value) {
+    const row = panelNode('div', null, {color: panelColors.muted, lineHeight: '1.9', fontSize: '12px'});
+    for (const part of value.split(/(\d+)/)) row.append(panelNode(/^\d+$/.test(part) ? 'strong' : 'span', part,
+      /^\d+$/.test(part) ? {color: panelColors.info, fontSize: '15px', fontWeight: '700'} : {}));
+    return row;
+  }
   const panel = document.createElement('aside');
   panel.id = 'h2s-monitor-panel';
-  Object.assign(panel.style, {position: 'fixed', right: '16px', bottom: '84px', zIndex: 2147483646, padding: '14px 16px',
-    width: '300px', maxWidth: '80vw', background: '#102c32', color: '#efffff', font: '13px/1.6 system-ui,sans-serif',
-    border: '1px solid #75c8d2', borderRadius: '12px', boxShadow: '0 6px 28px #0005', whiteSpace: 'pre-wrap'});
+  panel.setAttribute('aria-label', 'H2S 房源监控');
+  Object.assign(panel.style, {position: 'fixed', right: '16px', bottom: '84px', zIndex: 2147483646, padding: '16px',
+    boxSizing: 'border-box', width: '354px', maxWidth: 'calc(100vw - 32px)', maxHeight: 'calc(100vh - 108px)', overflowY: 'auto',
+    background: 'linear-gradient(145deg, #14283a, #0c1827)', color: panelColors.normal, font: '12px/1.55 system-ui,sans-serif',
+    fontVariantNumeric: 'tabular-nums', textAlign: 'left', letterSpacing: 'normal',
+    border: '1px solid #35516b', borderRadius: '16px', boxShadow: '0 12px 40px #0006', whiteSpace: 'normal'});
   document.body.append(panel);
   const panelText = document.createElement('div');
   const checkButton = document.createElement('button');
   checkButton.id = 'h2s-monitor-check';
   checkButton.type = 'button';
   checkButton.textContent = '立即检查（夜间也可运行）';
-  Object.assign(checkButton.style, {display: 'block', marginTop: '10px', padding: '6px 10px',
-    border: '1px solid #75c8d2', borderRadius: '6px', background: '#17434b', color: '#efffff', cursor: 'pointer'});
+  Object.assign(checkButton.style, {display: 'block', width: '100%', boxSizing: 'border-box', marginTop: '12px', padding: '10px 12px',
+    border: '1px solid #4bbbbb', borderRadius: '9px', background: 'linear-gradient(120deg, #116b70, #155b76)',
+    color: '#f0fdfa', font: '600 13px/1.5 system-ui,sans-serif', cursor: 'pointer'});
   checkButton.addEventListener('click', safe(async () => { requireIdle(); await runScan(true); }));
   panel.append(panelText, checkButton);
   function configured() { return Boolean(get('token', '') && get('chatId', '')); }
@@ -450,6 +474,26 @@
     if (stats.phase === '扫描未完成') return '尚未操作：本轮在排序前停止，见下方原因';
     return '尚未开始；扫描启动后自动选择 Price';
   }
+  function notificationSummary(history, filters, previous, pending, sameScope) {
+    if (!filters.ok) return '筛选条件通过并完成扫描后，才会生成房源通知。';
+    const scope = scopeFor(filters);
+    const requested = name => get(name, false) === true || get(name, false) === scope;
+    if (requested('notifyExisting')) return '已设置强制重发；下次完整扫描后发送符合房源。夜间请点立即检查。';
+    if (requested('silentBaseline')) return '已设置静默基线；下次扫描记录现有房源，不发送这些房源。';
+    if (!configured()) return 'Telegram 尚未配置；需要通知的房源会保留在待发队列。';
+    if (pending) return '当前有 ' + pending + ' 条待发；发送或重试进度见扫描状态。';
+    if (scanRunning) return '完成扫描后核对通知；已成功通知且无变化的房源不重发。';
+    if (sameScope && stats.phase === '扫描未完成') return '本轮扫描未完成验证，没有生成新的房源通知。';
+    if (!previous) return '尚无当前范围的完整扫描；立即检查会扫描，测试 Telegram 仅检查消息通道。';
+    if (sameScope && stats.sent) return '本轮已成功发送 ' + stats.sent + ' 条；重复检查不会重复发送未变化的房源。';
+    if (!previous.matched) return '上次完整扫描没有符合城市、预算和可订条件的房源。';
+    const eligible = Object.values(history.cities).flatMap(state => Object.values(state.items))
+      .filter(item => item.eligible && !item.missing && item.rent <= MAX_RENT && matchesCity(item.city, targetsFor(filters)));
+    const silent = eligible.some(item => item.initialNoticeSkipped && item.lastNotified == null);
+    if (silent) return '当前无待发通知；静默基线中的房源不首发，已通知且无变化的房源不重发。';
+    if (eligible.length && eligible.every(item => item.lastNotified != null)) return '符合房源已通知过；本轮没有需要新发的通知。';
+    return '当前无待发通知；仅通知新房源、降价或重新可订等变化。';
+  }
   function render() {
     const filters = filterState(document);
     const history = readHistory();
@@ -459,24 +503,49 @@
     const others = Object.values(history.cities).flatMap(state => Object.values(state.items)).filter(item => item.pending && item.eligible && !item.missing).length - pending;
     const sorting = priceSortState(document);
     const mode = sameScope ? stats.mode : previous?.mode;
-    panelText.textContent = ['H2S v1.3.8 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
-      '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
-      '可订状态：' + (filters.availability || '未筛选（仅通知可直接预订）'),
-      '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
-      '筛选条件：' + (filters.ok ? '通过' : '未通过；' + filters.reason),
-      '价格排序：' + sortingStatus(sorting, mode, filters),
-      ...(mode === 'city' ? ['扫描方式：读完当前城市全部页，再按预算筛选'] : []),
-      '扫描状态：' + (isLeader ? stats.phase : '待机，另一个标签页正在监控'), stats.message,
-      '已读 ' + (sameScope ? stats.scanned : previous?.inspected || 0) + ' 套 · 符合 ' + (sameScope ? stats.matched : previous?.matched || 0) + ' 套 · 第 ' + (sameScope ? stats.pages : previous?.pages || 0) + ' 页',
-      '本轮已发 ' + (sameScope ? stats.sent : 0) + ' · 当前范围待发 ' + pending + ' · 累计 ' + history.sent,
-      ...(others > 0 ? ['其他城市 / 范围待复查 ' + others + ' 条'] : []),
-      'Telegram：' + (configured() ? stats.telegram === '未配置' ? '已配置' : stats.telegram : '未配置（菜单设置）'),
-      '上次扫描终点：' + (previous ? previous.cutoff ? '超出预算，已停止翻页' : '已到最后一页' : '尚未完成'),
-      '上次完成预算内扫描 ' + formatTime(previous?.completedAt),
-      '下次刷新 ' + formatTime(filters.ok && lastScope === scopeFor(filters) ? nextRefresh : 0),
-      '自动运行 ' + String(START_HOUR).padStart(2, '0') + ':00–' + String(END_HOUR).padStart(2, '0') + ':00 荷兰时间'].join('\n');
+    const phase = isLeader ? stats.phase : '待机，另一个标签页正在监控';
+    const tone = !isLeader ? 'muted' : phase === '扫描未完成' || phase === '验证暂停' ? 'error'
+      : /暂停|重试/.test(phase) ? 'warning' : scanRunning || deliveryRunning ? 'info' : /完成/.test(phase) ? 'success' : 'muted';
+    const header = panelNode('div', null, {display: 'flex', alignItems: 'center', justifyContent: 'space-between'});
+    header.append(panelNode('strong', 'H2S', {fontSize: '21px', color: '#f0f9ff', letterSpacing: '0.5px'}),
+      panelNode('span', 'v1.3.9', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
+    const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + MAX_RENT, {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
+    const statusCard = panelNode('div', null, {background: panelBackgrounds[tone], borderLeft: '3px solid ' + panelColors[tone],
+      borderRadius: '8px', padding: '9px 11px', marginBottom: '10px'});
+    statusCard.append(panelNode('div', '扫描状态：' + phase, {color: panelColors[tone], fontWeight: '700', fontSize: '13px'}),
+      panelNode('div', stats.message, {color: panelColors.normal, marginTop: '4px', overflowWrap: 'anywhere'}));
+    const counts = panelNode('div', null, {padding: '5px 0 10px', borderBottom: '1px solid #2b4055', marginBottom: '10px'});
+    counts.append(panelNumbers('已读 ' + (sameScope ? stats.scanned : previous?.inspected || 0) + ' 套 · 符合 ' +
+      (sameScope ? stats.matched : previous?.matched || 0) + ' 套 · 第 ' + (sameScope ? stats.pages : previous?.pages || 0) + ' 页'),
+      panelNumbers('本轮已发 ' + (sameScope ? stats.sent : 0) + ' · 当前范围待发 ' + pending + ' · 累计 ' + history.sent));
+    const details = panelNode('div');
+    details.append(panelRow('当前城市', filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
+      panelRow('可订状态', filters.availability || '未筛选（仅通知可直接预订）'),
+      panelRow('目标城市', filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认', 'muted'),
+      panelRow('筛选条件', filters.ok ? '通过' : '未通过；' + filters.reason, filters.ok ? 'success' : 'warning'),
+      panelRow('价格排序', sortingStatus(sorting, mode, filters), sorting.ok || mode === 'single' ? 'success' : 'warning'));
+    if (mode === 'city') details.append(panelRow('扫描方式', '读完当前城市全部页，再按预算筛选', 'info'));
+    if (others > 0) details.append(panelNode('div', '其他城市 / 范围待复查 ' + others + ' 条', {color: panelColors.warning}));
+    const telegramLabel = configured() ? stats.telegram === '未配置' ? '已配置' : stats.telegram : '未配置（菜单设置）';
+    details.append(panelRow('Telegram', telegramLabel, !configured() ? 'warning' : /失败|错误|异常|超时|HTTP|限流/.test(telegramLabel)
+      ? 'error' : /成功/.test(telegramLabel) ? 'success' : 'info'));
+    const notification = panelNode('div', null, {background: '#142536', border: '1px solid #294359', borderRadius: '8px',
+      padding: '8px 10px', margin: '10px 0', color: pending || !configured() ? panelColors.warning : panelColors.muted});
+    notification.append(panelNode('strong', '通知说明：', {color: panelColors.info}),
+      panelNode('span', notificationSummary(history, filters, previous, pending, sameScope)));
+    const footer = panelNode('div', null, {color: panelColors.muted, fontSize: '11px', lineHeight: '1.7'});
+    footer.append(panelNode('div', '上次扫描终点：' + (previous ? previous.cutoff ? '超出预算，已停止翻页' : '已到最后一页' : '尚未完成')),
+      panelNode('div', '上次完成预算内扫描 ' + formatTime(previous?.completedAt)));
+    const refresh = panelNode('div', null, {display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+      padding: '8px 0 4px', marginTop: '6px', borderTop: '1px solid #2b4055'});
+    refresh.append(panelNode('span', '下次刷新 ', {color: panelColors.muted}), panelNode('strong',
+      formatTime(filters.ok && lastScope === scopeFor(filters) ? nextRefresh : 0), {fontSize: '17px', color: panelColors.info}));
+    const hours = panelNode('div', '自动运行 ' + String(START_HOUR).padStart(2, '0') + ':00–' + String(END_HOUR).padStart(2, '0') +
+      ':00 荷兰时间', {color: panelColors.muted, fontSize: '11px'});
+    panelText.replaceChildren(header, budget, statusCard, counts, details, notification, footer, refresh, hours);
     checkButton.disabled = !isLeader || scanRunning || deliveryRunning || get('paused', false) || !filters.ok || challenge(document);
     checkButton.style.opacity = checkButton.disabled ? '0.55' : '1';
+    checkButton.style.cursor = checkButton.disabled ? 'not-allowed' : 'pointer';
   }
   function setMessage(message) { stats.message = message; render(); }
   function setStatus(phase, message) { stats.phase = phase; setMessage(message); }
@@ -844,6 +913,7 @@
     history.scans = {};
     set('state', history); set('notifyExisting', false); set('silentBaseline', scopeFor(filters));
     deliveryContext = null; dirty = true; retryAt = 0;
+    render();
   });
   register('重新通知当前符合条件的房源（强制重发）', () => {
     requireIdle();
@@ -851,6 +921,7 @@
     if (!configured()) throw Error('请先配置 Telegram');
     if (!confirm('下一次预算内扫描后，重新发送当前扫描范围内所有符合条件的房源？')) return;
     set('notifyExisting', scopeFor(filters)); set('silentBaseline', false); dirty = true; retryAt = 0;
+    render();
   });
   register('查看历史', () => {
     const history = readHistory();
