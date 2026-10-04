@@ -9,6 +9,7 @@ const fixture = fs.readFileSync(__dirname + '/fixtures/residences.html', 'utf8')
 const selectedCityFixture = fs.readFileSync(__dirname + '/fixtures/the-hague-filters.html', 'utf8');
 const selectedCityPage = fs.readFileSync(__dirname + '/fixtures/the-hague-listings.html', 'utf8');
 const actualSortMenu = fs.readFileSync(__dirname + '/fixtures/sort-menu.html', 'utf8');
+const actualDateSortMenu = fs.readFileSync(__dirname + '/fixtures/sort-menu-date.html', 'utf8');
 const availabilityFixture = fs.readFileSync(__dirname + '/fixtures/availability-filters.html', 'utf8');
 const source = fs.readFileSync(__dirname + '/../h2s-monitor.user.js', 'utf8');
 const targets = ['The Hague','Rijswijk','Rotterdam','Leiden','Zoetermeer'];
@@ -160,6 +161,24 @@ test('actual SortItem-activeButton determines selection even while the trigger s
   assert.equal(core.priceSortState(document).selected,false,'The active date choice overrides a stale trigger label');
   assert.equal(core.priceSortState(document).ok,false);
 });
+test('hidden old Date marker cannot override the visible Price trigger', () => {
+  const {document}=parseHTML(selectedCityFixture);
+  const root=document.querySelector('[data-cy="ProductSort-root"]');
+  root.innerHTML='<button data-cy="ProductSort-sortButton">Price</button><div style="display:none"><button data-cy="SortItem-activeButton">Available start date</button></div>';
+  assert.equal(core.priceSortState(document).ok,true);
+  root.innerHTML='<button data-cy="ProductSort-sortButton">Available start date</button><div hidden><button data-cy="SortItem-activeButton">Price</button></div>';
+  assert.equal(core.priceSortState(document).ok,false,'hidden Price must not certify a date-sorted list');
+});
+test('an invisible duplicate Sort root does not replace the visible control', () => {
+  const {document}=parseHTML(selectedCityFixture);
+  const root=document.querySelector('[data-cy="ProductSort-root"]');
+  root.querySelector('button').textContent='Price';
+  const hidden=root.cloneNode(true);hidden.style.display='none';
+  hidden.querySelector('button').textContent='Available start date';
+  root.before(hidden);
+  const state=core.priceSortState(document);
+  assert.ok(state.root===root,'use the visible root');assert.equal(state.ok,true);
+});
 test('uploaded The Hague page has nine unsorted listings, with only three direct-booking matches within €1500', () => {
   const page=core.parsePage(parseHTML(selectedCityPage).document);
   assert.equal(page.total,9);assert.equal(page.page.last,1);assert.equal(page.page.next,null);
@@ -306,7 +325,7 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
 function harness({pages, cityFilter = null, collapsedCity = false, extraFilter = false, actualCityControls = false,
   sortMode = 'asc', sortOptionLabel = 'Price: Low to High', sortOptionTag = 'button', canSort = true, configured = false, blocked = false, brokenPage = 0,
   actualSortControls = false, sortMenuOpen = false, availability = null, collapsedAvailability = false,
-  sortDelay = 0, ignorePrice = false, closeSortMenu = false,
+  sortDelay = 0, ignorePrice = false, closeSortMenu = false, ignorePriceClicks = 0, dateTrigger = false, sortBusyMs = 0,
   startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
   pages ||= [[sample()], [sample({rent:1000,url:sample().url.replace('example','second')})]];
   const {document,window} = parseHTML(fixture);
@@ -362,8 +381,9 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
   if (!sorting) {sorting = document.createElement('div');sorting.setAttribute('data-cy','ProductSort-root');document.body.append(sorting);}
   sorting.innerHTML = '<button data-cy="ProductSort-sortButton">'+(sortMode==='asc' ? 'Price: Low to High' : sortMode==='desc' ? 'Price: High to Low' : sortMode==='price' ? 'Price' : 'Sort ...')+'</button>';
   let sortClicks = 0, sortOptionClicks = 0;
+  let pendingSort = null;
   if(actualSortControls){
-    sorting.innerHTML=parseHTML(actualSortMenu).document.querySelector('[data-cy="ProductSort-root"]').innerHTML;
+    sorting.innerHTML=parseHTML(dateTrigger?actualDateSortMenu:actualSortMenu).document.querySelector('[data-cy="ProductSort-root"]').innerHTML;
     sorting.setAttribute('aria-busy','false');
     const menu=sorting.querySelector('div');
     const options=[...menu.querySelectorAll('button')];
@@ -375,10 +395,16 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
     });
     options.forEach(button=>button.addEventListener('click',()=>{
       sortOptionClicks++;
-      if (!ignorePrice) options.forEach(option=>option.setAttribute('data-cy',option===button?'SortItem-activeButton':'SortItem-button'));
-      if (closeSortMenu) menu.remove();
-      // Keep the header at Sort ... to test the actual active-item marker.
-      showPage(1);
+      if (ignorePrice || sortOptionClicks <= ignorePriceClicks) return;
+      const apply = () => {
+        options.forEach(option=>option.setAttribute('data-cy',option===button?'SortItem-activeButton':'SortItem-button'));
+        if (closeSortMenu) menu.remove();
+        // Keep the original header to test the actual active-item marker.
+        sorting.setAttribute('aria-busy','false');
+        showPage(1);
+      };
+      if (sortBusyMs) {sorting.setAttribute('aria-busy','true');pendingSort={at:clock+sortBusyMs,apply};}
+      else apply();
     }));
   }else{
     sorting.querySelector('button').addEventListener('click',() => {
@@ -423,7 +449,12 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
   const sandbox = {document,window,Date:Clock,Intl,URL,console,crypto:require('node:crypto').webcrypto,
     location:{pathname:'/residences',origin:'https://www.holland2stay.com',reload(){reloads++;}},
     navigator:{locks:{request:async(name,fn)=>fn()}},
-    setTimeout(fn,ms){queueMicrotask(()=>{clock+=ms;if(sortWaiting && clock>=sortReadyAt){document.body.append(sorting);sortWaiting=false;}fn();});return 1;},clearTimeout(){},
+    setTimeout(fn,ms){queueMicrotask(()=>{
+      clock+=ms;
+      if(sortWaiting && clock>=sortReadyAt){document.body.append(sorting);sortWaiting=false;}
+      if(pendingSort && clock>=pendingSort.at){const current=pendingSort;pendingSort=null;current.apply();}
+      fn();
+    });return 1;},clearTimeout(){},
     setInterval(fn){intervals.push(fn);return 1;},clearInterval(){},MutationObserver:class{observe(){}disconnect(){}},
     prompt:()=>null,confirm:()=>true,alert(){},
     GM_getValue:(key,fallback)=>storage.has(key)?structuredClone(storage.get(key)):fallback,
@@ -685,8 +716,24 @@ test('a menu that does not open is distinguished from a Price click that did not
   assert.ok(unopened.sortClicks>0);assert.equal(unopened.sortOptionClicks,0);assert.equal(unopened.history,undefined);
   assert.match(unopened.panel,/已尝试展开 Sort，等待 Price 选项出现/);
   const unapplied=harness({actualSortControls:true,sortMode:'unset',ignorePrice:true});await drain();
-  assert.equal(unapplied.sortOptionClicks,1);assert.equal(unapplied.history,undefined);
-  assert.match(unapplied.panel,/已点击 Price，但官网尚未显示 Price 选中/);
+  assert.equal(unapplied.sortOptionClicks,3);assert.equal(unapplied.history,undefined);
+  assert.match(unapplied.panel,/已点击 Price 3\/3 次；网页当前选中：Available start date/);
+  assert.match(unapplied.panel,/已停止重试/);assert.equal(unapplied.messages.length,0);
+});
+test('Date-selected menu recovers if the first Price click has no effect',async()=>{
+  for(const closeSortMenu of [false,true]){
+    const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',ignorePriceClicks:1,closeSortMenu,configured:true});
+    await drain();
+    assert.equal(app.messages.length,2,app.panel);
+    assert.equal(app.sortOptionClicks,2,'retry after the first unapplied click');
+    assert.match(app.panel,/Price · 从低到高/);
+    await check(app);assert.equal(app.sortOptionClicks,2);assert.equal(app.messages.length,2);
+  }
+});
+test('a pending sort request is allowed to finish without retry clicks while aria-busy',async()=>{
+  const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',sortBusyMs:10000,configured:true});
+  await drain();assert.equal(app.messages.length,2,app.panel);
+  assert.equal(app.sortOptionClicks,1,'do not retry an in-flight sort request');
 });
 test('nighttime check with real city controls waits for recent interaction then sorts and scans automatically',async()=>{
   const app=harness({cityFilter:'The Hague',actualCityControls:true,sortMode:'unset',configured:true,startTime:'2026-10-03T22:00:00Z'});

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.6
+// @version      1.3.7
 // @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -29,6 +29,8 @@
   const REFRESH_MINUTES = [5, 15];
   const MIN_SETTLE_MS = 10000;
   const MAX_SETTLE_MS = 30000;
+  const SORT_RETRY_MS = 3000;
+  const SORT_MAX_ATTEMPTS = 3;
   const MAX_PAGES = 50;
   const VERSION = 1;
   const HISTORY_VERSION = 2;
@@ -214,16 +216,31 @@
     return filters.ok ? JSON.stringify([filters.allCities ? '*' : cityKey(filters.city), filters.availability || '']) : null;
   }
   function forgetPriceSort(doc) { sortSelections.delete(doc); }
+  function visibleSortNode(doc, node) {
+    if (!node) return false;
+    const getStyle = doc.defaultView?.getComputedStyle;
+    for (let el = node; el; el = el.parentElement) {
+      if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true' ||
+          el.style?.display === 'none' || ['hidden', 'collapse'].includes(el.style?.visibility)) return false;
+      if (getStyle) {
+        const css = getStyle.call(doc.defaultView, el);
+        if (css.display === 'none' || ['hidden', 'collapse'].includes(css.visibility)) return false;
+      }
+    }
+    return true;
+  }
   function priceSortState(doc) {
-    const root = doc.querySelector('[data-cy="ProductSort-root"]');
-    const button = root?.querySelector('[data-cy="ProductSort-sortButton"]');
-    const chosen = root?.querySelector('[data-cy="SortItem-activeButton"]') ||
-      root?.querySelector('[aria-selected="true"],[aria-checked="true"],input:checked');
+    const root = [...doc.querySelectorAll('[data-cy="ProductSort-root"]')].find(node => visibleSortNode(doc, node));
+    const button = [...(root?.querySelectorAll('[data-cy="ProductSort-sortButton"]') || [])].find(node => visibleSortNode(doc, node));
+    const chosen = [...(root?.querySelectorAll('[data-cy="SortItem-activeButton"]') || []),
+      ...(root?.querySelectorAll('[aria-selected="true"],[aria-checked="true"],input:checked') || [])].find(node => visibleSortNode(doc, node));
     const context = sortContext(doc);
     const cached = sortSelections.get(doc);
     if (!root || context === null || (cached && (cached.root !== root || cached.context !== context))) forgetPriceSort(doc);
     const busy = root?.getAttribute('aria-busy') === 'true';
-    const label = chosen ? text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label') : text(button);
+    const activeLabel = chosen ? text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label') : '';
+    const triggerLabel = text(button);
+    const label = activeLabel || triggerLabel;
     const choice = sortChoice(label);
     let selection = null;
     // Actual active options always override a stale trigger or cached selection.
@@ -238,7 +255,7 @@
     const selected = selection?.key === 'price' && selection.ascending;
     return {ok: Boolean(root && !busy && selected), selected: Boolean(selected), busy,
       choice: selection?.key || '', ascending: Boolean(selection?.ascending),
-      source: selection?.source || '', button, root};
+      source: selection?.source || '', activeLabel, triggerLabel, button, root};
   }
   function sortOptions(doc, sorting = priceSortState(doc)) {
     const candidates = [...(sorting.root?.querySelectorAll('button[data-cy="SortItem-button"],button[data-cy="SortItem-activeButton"]') || []),
@@ -246,17 +263,8 @@
       ...doc.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]'),
       ...[...(sorting.root?.querySelectorAll('li') || [])].filter(node => !node.querySelector('button,a,[role="option"],[role="menuitem"],label'))];
     return [...new Set(candidates)].filter(node => {
-      if (node === sorting.button || sorting.button?.contains(node) || node.closest('[hidden],[aria-hidden="true"]') ||
+      if (node === sorting.button || sorting.button?.contains(node) || !visibleSortNode(doc, node) ||
           node.hasAttribute('disabled') || node.getAttribute('aria-disabled') === 'true') return false;
-      // Ignore menus kept in the DOM with display:none; jsdom/linkedom need no layout.
-      const style = doc.defaultView?.getComputedStyle;
-      for (let el = node; el && el !== doc.body; el = el.parentElement) {
-        if (el.style?.display === 'none' || el.style?.visibility === 'hidden') return false;
-        if (style) {
-          const css = style.call(doc.defaultView, el);
-          if (css.display === 'none' || css.visibility === 'hidden') return false;
-        }
-      }
       return isPriceChoice(text(node)) || /^available start date$/i.test(text(node));
     });
   }
@@ -424,7 +432,7 @@
     const others = Object.values(history.cities).flatMap(state => Object.values(state.items)).filter(item => item.pending && item.eligible && !item.missing).length - pending;
     const sorting = priceSortState(document);
     const mode = sameScope ? stats.mode : previous?.mode;
-    panelText.textContent = ['H2S v1.3.6 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
+    panelText.textContent = ['H2S v1.3.7 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
       '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
       '可订状态：' + (filters.availability || '未筛选（仅通知可直接预订）'),
       '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
@@ -473,7 +481,8 @@
     stats.sortStep = '正在准备 Price 排序';
     setStatus('准备排序', '正在选择 Price（从低到高）');
     const start = Date.now();
-    let clickedPrice = false;
+    let attempts = 0;
+    let lastClickAt = -Infinity;
     let lastOpenAt = -Infinity;
     let reason = '排序控件尚未加载';
     while (Date.now() - start < MAX_SETTLE_MS) {
@@ -485,16 +494,17 @@
       } else {
         const options = sortOptions(document, sorting);
         const option = options.find(node => isPriceChoice(text(node)));
-        if (option && !clickedPrice) {
+        const observed = (sorting.activeLabel || sorting.triggerLabel || '未识别').slice(0, 80);
+        if (option && attempts < SORT_MAX_ATTEMPTS && Date.now() - lastClickAt >= SORT_RETRY_MS) {
           // Invalidate a previous Date selection before React handles the click.
           forgetPriceSort(document);
           option.click();
-          clickedPrice = true;
-          lastOpenAt = Date.now();
-          reason = '已点击 Price，等待官网确认选中';
+          attempts++;
+          lastClickAt = lastOpenAt = Date.now();
+          reason = '已点击 Price（第 ' + attempts + '/' + SORT_MAX_ATTEMPTS + ' 次），等待官网确认选中';
         } else if (!options.length) {
           reason = !sorting.button ? '未找到 Sort 按钮，等待控件加载'
-            : clickedPrice ? '已点击 Price，重新展开菜单核对选中项' : '已尝试展开 Sort，等待 Price 选项出现';
+            : attempts ? '已点击 Price，重新展开菜单核对选中项' : '已尝试展开 Sort，等待 Price 选项出现';
           if (sorting.button && !sorting.button.disabled && sorting.button.getAttribute('aria-disabled') !== 'true' && Date.now() - lastOpenAt >= 1500) {
             // Selecting Price may immediately unmount the menu while the trigger
             // still says Sort ... . Reopen it and read SortItem-activeButton.
@@ -502,7 +512,9 @@
             lastOpenAt = Date.now();
           }
         } else {
-          reason = clickedPrice ? '已点击 Price，但官网尚未显示 Price 选中' : 'Sort 菜单中未找到可用的 Price 选项';
+          reason = attempts ? '已点击 Price ' + attempts + '/' + SORT_MAX_ATTEMPTS + ' 次；网页当前选中：' + observed +
+            (attempts < SORT_MAX_ATTEMPTS ? '；等待确认，未生效将重试' : '；仍未确认 Price，已停止重试')
+            : 'Sort 菜单中未找到可用的 Price 选项';
         }
       }
       stats.sortStep = reason;
