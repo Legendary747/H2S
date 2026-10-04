@@ -327,9 +327,18 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
   actualSortControls = false, sortMenuOpen = false, availability = null, collapsedAvailability = false,
   sortDelay = 0, ignorePrice = false, closeSortMenu = false, ignorePriceClicks = 0, dateTrigger = false, sortBusyMs = 0,
   sortInteraction = 'click', updateSortTitle = false,
-  startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
+  startTime = '2026-10-03T10:00:00Z', initialState, initialStorage, promptResponses = [], onRequest, onPage} = {}) {
   pages ||= [[sample()], [sample({rent:1000,url:sample().url.replace('example','second')})]];
   const {document,window} = parseHTML(fixture);
+  const pageFetchResponses=[];
+  // A page-owned fetch stub lets the userscript observe responses without issuing
+  // any real request. It is installed before injection, like the site's fetch.
+  window.fetch=url=>{
+    const response=pageFetchResponses.shift() || {};
+    const headers=new Map(Object.entries(response.headers || {}).map(([name,value])=>[name.toLowerCase(),String(value)]));
+    return Promise.resolve({url:'https://www.holland2stay.com'+url,status:response.status ?? 200,headers:{get:name=>headers.get(name.toLowerCase()) || null}});
+  };
+  const simulateFetch=response=>{pageFetchResponses.push(response);return window.fetch('/graphql');};
   // linkedom has no native mouse/pointer constructors or layout. These are
   // explicit test doubles, not a claim of browser-level input validation.
   window.MouseEvent = class extends window.Event {
@@ -462,12 +471,13 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
       '<li><a aria-label="Next page" aria-disabled="'+(number===pages.length)+'">Next</a></li>';
     pager.querySelectorAll('[aria-label^="Page "]').forEach(link => link.addEventListener('click',() => showPage(Number(link.textContent))));
     pager.querySelector('[aria-label="Next page"]').addEventListener('click',() => {if(number<pages.length) showPage(number+1);});
-    if (visited.length>1) onPage?.({number,document,selectCity,selectAvailability});
+    if (visited.length>1) onPage?.({number,document,selectCity,selectAvailability,simulateFetch});
   }
   showPage(1);
   if (blocked) document.title='Just a moment...';
-  const storage = new Map(), menus = new Map(), intervals = [], messages = [];
-  let clock = Date.parse(startTime), networkCalls = 0, reloads = 0;
+  const storage = new Map(initialStorage ? structuredClone([...initialStorage]) : []), menus = new Map(), intervals = [], messages = [], requests = [], alerts = [];
+  const answers = [...promptResponses];
+  let clock = typeof startTime === 'number' ? startTime : Date.parse(startTime), networkCalls = 0, reloads = 0;
   const sortReadyAt = clock + sortDelay;
   let sortWaiting = sortDelay > 0;
   if (sortWaiting) sorting.remove();
@@ -476,7 +486,7 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
   if (configured) {storage.set(prefix+'token','123456:offline_test_token_not_real');storage.set(prefix+'chatId','12345');}
   const manualClick = (target = pager) => {for(const fn of handlers.get('click')||[]) fn({isTrusted:true,target});};
   class Clock extends Date {constructor(...args){super(...(args.length?args:[clock]));}static now(){return clock;}}
-  const sandbox = {document,window,Date:Clock,Intl,URL,console,crypto:require('node:crypto').webcrypto,
+  const sandbox = {document,window,unsafeWindow:window,Date:Clock,Intl,URL,console,crypto:require('node:crypto').webcrypto,
     location:{pathname:'/residences',origin:'https://www.holland2stay.com',reload(){reloads++;}},
     navigator:{locks:{request:async(name,fn)=>fn()}},
     setTimeout(fn,ms){queueMicrotask(()=>{
@@ -486,24 +496,27 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
       fn();
     });return 1;},clearTimeout(){},
     setInterval(fn){intervals.push(fn);return 1;},clearInterval(){},MutationObserver:class{observe(){}disconnect(){}},
-    prompt:()=>null,confirm:()=>true,alert(){},
+    prompt:()=>answers.length ? answers.shift() : null,confirm:()=>true,alert:message=>alerts.push(message),
     GM_getValue:(key,fallback)=>storage.has(key)?structuredClone(storage.get(key)):fallback,
     GM_setValue:(key,value)=>storage.set(key,structuredClone(value)),GM_registerMenuCommand:(label,fn)=>menus.set(label,fn),
     GM_xmlhttpRequest(request){
       networkCalls++;
       if(!configured) throw Error('Unexpected notification');
-      const attempt=networkCalls, body=JSON.parse(request.data);
+      const attempt=networkCalls, body=request.data ? JSON.parse(request.data) : null;
+      requests.push({url:request.url,body,at:clock});
       queueMicrotask(()=>{
-        const response=onRequest?.({attempt,body,document,selectCity,selectAvailability,manualClick});
+        const response=onRequest?.({attempt,body,request,document,selectCity,selectAvailability,manualClick});
         if(response==='error'){request.onerror();return;}
-        if(response==='429'){request.onload({status:429,responseText:JSON.stringify({ok:false,parameters:{retry_after:60}})});return;}
+        if(response==='429' || response?.status===429){request.onload({status:429,responseText:JSON.stringify({ok:false,parameters:{retry_after:response.retryAfter ?? 60}})});return;}
+        if(request.url.endsWith('/getUpdates')){request.onload({status:200,responseText:JSON.stringify({ok:true,result:[]})});return;}
         messages.push(body);
         request.onload({status:200,responseText:JSON.stringify({ok:true,result:{message_id:messages.length}})});
       });
     }};
   vm.runInNewContext(source,sandbox,{filename:'h2s-monitor.user.js'});
-  return {document,storage,menus,intervals,visited,prefix,messages,selectCity,selectAvailability,manualClick,
+  return {document,storage,menus,intervals,visited,prefix,messages,requests,alerts,selectCity,selectAvailability,manualClick,simulateFetch,
     advance:ms=>{clock+=ms;},tick:()=>intervals[0](),
+    get now(){return clock;},
     get history(){return storage.get(prefix+'state');},get panel(){return document.querySelector('#h2s-monitor-panel').textContent;},
     get resets(){return resets;},get sortClicks(){return sortClicks;},get sortOptionClicks(){return sortOptionClicks;},get networkCalls(){return networkCalls;},get reloads(){return reloads;}};
 }
@@ -626,7 +639,7 @@ test('complete-scan fallback refuses missing or duplicate cards and preserves pr
     if(settings.sortMode==='missing') app.document.querySelector('.total_residence .count').textContent='2';
     await check(app);
     assert.deepEqual(app.history,baseline.history,app.panel);assert.equal(app.messages.length,0);
-    assert.match(app.panel,/扫描未完成/);
+    assert.match(app.panel,/扫描失败，等待重试/);
   }
 });
 test('unknown sort and descending actual prices never initialize history or continue pagination',async()=>{
@@ -864,4 +877,191 @@ test('silent reset and forced resend apply only to the current scope and later s
 test('challenge pages pause without sorting, pagination, or altering listing history',async()=>{
   const app=harness({blocked:true});await drain();assert.equal(app.history,undefined);
   assert.deepEqual(app.visited,[1]);assert.equal(app.sortClicks,0);assert.match(app.panel,/验证暂停/);
+});
+
+test('budget menu persists through reload and includes the exact configured ceiling without repeating sent listings',async()=>{
+  const pages=[priced([900,1000,1000.01,1100])];
+  const app=harness({pages,configured:true,promptResponses:['1000.01']});await drain();
+  assert.equal(app.messages.length,2);
+  app.menus.get('设置预算（主租金上限）')();await drain();
+  assert.equal(app.storage.get(app.prefix+'maxRent'),1000.01);
+  await check(app);
+  assert.equal(app.messages.length,3,'raising the ceiling sends only the newly eligible listing');
+  assert.ok(app.messages[2].text.includes('€1000.01'));
+  assert.ok(!app.messages.some(message=>message.text.includes('€1100.00')));
+  const reloaded=harness({pages,configured:true,initialStorage:app.storage,startTime:app.now});await drain();
+  assert.equal(reloaded.storage.get(reloaded.prefix+'maxRent'),1000.01);
+  assert.match(reloaded.panel,/主租金 ≤ €1000\.01/);
+  assert.equal(reloaded.messages.length,0,'all sent markers survive updating the budget and reloading');
+  assert.equal(reloaded.history.sent,3);
+});
+
+test('budget menu rejects invalid amounts and cancellation without changing saved settings or history',async()=>{
+  const prefix='h2s_single_city_den_haag:';
+  for(const value of ['0','-1','NaN','Infinity','100000.01','1000.001','900xyz','',null]){
+    const app=harness({initialStorage:new Map([[prefix+'maxRent',1250]]),promptResponses:[value],configured:true});await drain();
+    const history=structuredClone(app.history);
+    app.menus.get('设置预算（主租金上限）')();await drain();
+    assert.equal(app.storage.get(prefix+'maxRent'),1250,String(value));
+    assert.deepEqual(app.history,history,String(value));
+    assert.equal(app.messages.length,2,String(value));
+  }
+  const app=harness({promptResponses:['999,50'],configured:true});await drain();
+  app.menus.get('设置预算（主租金上限）')();await drain();
+  assert.equal(app.storage.get(prefix+'maxRent'),999.5,'a decimal comma is accepted');
+});
+
+test('three ordinary failures back off for 60/120 seconds, persist a pause, and send one failure notice until explicit recovery',async()=>{
+  const app=harness({sortMode:'unset',canSort:false,configured:true});await drain();
+  const failure=()=>app.storage.get(app.prefix+'scanFailure');
+  assert.equal(failure().count,1);assert.equal(failure().retryAt-app.now,60000);
+  const firstClicks=app.sortClicks;
+  app.advance(59000);app.tick();await drain();assert.equal(app.sortClicks,firstClicks);
+  app.advance(1000);app.tick();await drain();
+  assert.equal(failure().count,2);assert.equal(failure().retryAt-app.now,120000);
+  assert.ok(app.sortClicks>firstClicks);assert.equal(app.messages.length,0);
+  const secondClicks=app.sortClicks;
+  app.advance(119000);app.tick();await drain();assert.equal(app.sortClicks,secondClicks);
+  app.advance(1000);app.tick();await drain();
+  assert.equal(failure().count,3);assert.equal(failure().paused,true);
+  assert.equal(app.messages.length,1);assert.equal(app.history,undefined);
+  assert.match(app.messages[0].text,/失败|故障/);
+  const stoppedClicks=app.sortClicks;
+  app.advance(3600000);app.tick();await drain();
+  assert.equal(app.sortClicks,stoppedClicks);assert.equal(app.messages.length,1);assert.equal(app.reloads,0);
+  const reloaded=harness({initialStorage:app.storage,configured:true,startTime:app.now,sortMode:'price'});await drain();
+  assert.equal(reloaded.history,undefined,'a reload must not silently clear the persisted failure pause');
+  assert.equal(reloaded.networkCalls,0,'a delivered fault notice must not repeat after reload');
+  assert.equal(reloaded.sortClicks,0);
+  reloaded.menus.get('恢复故障暂停并立即检查')();await drain();
+  assert.equal(reloaded.messages.length,2,'explicit recovery scans and sends listings after the sorting problem is fixed');
+  assert.equal(reloaded.history.sent,2);
+  assert.equal(reloaded.storage.get(reloaded.prefix+'scanFailure')?.count || 0,0);
+  assert.match(reloaded.panel,/本轮已完成/);
+});
+
+test('changing filters during a sweep cancels without counting as a scanner failure or notifying a fault',async()=>{
+  const app=harness({cityFilter:'The Hague',configured:true,onPage:({number,selectCity})=>{
+    if(number===2)selectCity('Leiden');
+  }});await drain();
+  assert.equal(app.history,undefined);assert.equal(app.messages.length,0);
+  assert.equal(app.storage.get(app.prefix+'scanFailure')?.count || 0,0);
+  assert.match(app.panel,/筛选条件已改变/);
+});
+
+test('Telegram challenge notices honor a 600-second response across ticks, reload, test and pairing commands',async()=>{
+  const app=harness({blocked:true,configured:true,onRequest:()=>({status:429,retryAfter:600})});await drain();
+  assert.equal(app.networkCalls,1);assert.equal(app.messages.length,0);
+  const until=app.storage.get(app.prefix+'telegramCooldownUntil');
+  assert.equal(until-app.requests[0].at,600000);
+  app.advance(61000);app.tick();await drain();assert.equal(app.networkCalls,1,'the old 60-second notice interval must not override server cooldown');
+  const reloaded=harness({blocked:true,configured:true,initialStorage:app.storage,startTime:app.now,promptResponses:['pair']});await drain();
+  assert.equal(reloaded.networkCalls,0);
+  reloaded.menus.get('测试 Telegram')();await drain();
+  reloaded.menus.get('自动获取 Chat ID（配对）')();await drain();
+  assert.equal(reloaded.networkCalls,0,'manual Telegram paths share the persisted cooldown');
+  reloaded.advance(until-reloaded.now-1);reloaded.tick();await drain();assert.equal(reloaded.networkCalls,0);
+  reloaded.advance(1);reloaded.tick();await drain();
+  assert.equal(reloaded.networkCalls,1);assert.equal(reloaded.messages.length,1);
+  reloaded.advance(60000);reloaded.tick();await drain();assert.equal(reloaded.networkCalls,1,'a successful block notice is deduplicated');
+});
+
+test('Telegram listing rate limits survive reload and preserve pending messages until the full cooldown expires',async()=>{
+  const app=harness({pages:[[sample()]],configured:true,onRequest:()=>({status:429,retryAfter:600})});await drain();
+  assert.equal(app.networkCalls,1);assert.equal(app.messages.length,0);
+  assert.equal(rowsOf(app.history).filter(item=>item.pending).length,1);
+  const until=app.storage.get(app.prefix+'telegramCooldownUntil');
+  const reloaded=harness({pages:[[sample()]],configured:true,initialStorage:app.storage,startTime:app.now});await drain();
+  assert.equal(reloaded.networkCalls,0);assert.equal(reloaded.history.sent,0);
+  reloaded.advance(until-reloaded.now-1);reloaded.tick();await drain();assert.equal(reloaded.networkCalls,0);
+  reloaded.advance(1);reloaded.tick();await drain();
+  assert.equal(reloaded.networkCalls,1);assert.equal(reloaded.history.sent,1);
+  assert.equal(rowsOf(reloaded.history).filter(item=>item.pending).length,0);
+  assert.ok(reloaded.requests[0].at>=until);
+});
+
+test('an observed API challenge before or during scanning prevents stale cards from entering history or listing notifications',async()=>{
+  for(const duringScan of [false,true]){
+    const app=harness({configured:true,startTime:duringScan ? '2026-10-03T10:00:00Z' : '2026-10-03T22:00:00Z',
+      onPage:({number,simulateFetch})=>{if(duringScan && number===2)simulateFetch({status:403,headers:{'cf-mitigated':'challenge'}});}});
+    if(!duringScan){await drain();await app.simulateFetch({status:403,headers:{'cf-mitigated':'challenge'}});}
+    await drain();
+    assert.equal(app.storage.get(app.prefix+'networkHold').kind,'challenge');
+    const visited=[...app.visited];
+    await check(app);app.tick();await drain();
+    assert.equal(app.history,undefined);assert.deepEqual(app.visited,visited);
+    assert.equal(app.messages.filter(message=>message.text.includes('主租金：')).length,0);
+    assert.equal(app.storage.get(app.prefix+'scanFailure')?.count || 0,0,'a challenge is not an ordinary scanner failure');
+    assert.equal(app.reloads,0);
+  }
+});
+
+test('API 429 persists its 600-second wait, blocks manual bypass, and reloads before accepting visible cards',async()=>{
+  const app=harness({configured:true});
+  await app.simulateFetch({status:429,headers:{'Retry-After':'600'}});await drain();
+  const until=app.storage.get(app.prefix+'networkHold').retryAt;
+  await check(app);
+  app.menus.get('恢复接口暂停（验证完成后）')();await drain();
+  assert.equal(app.reloads,0);assert.equal(app.history,undefined);
+  const reloaded=harness({configured:true,initialStorage:app.storage,startTime:app.now});await drain();
+  assert.equal(reloaded.history,undefined);assert.equal(reloaded.reloads,0);
+  reloaded.advance(until-reloaded.now-1);await check(reloaded);
+  assert.equal(reloaded.reloads,0);assert.equal(reloaded.history,undefined);
+  reloaded.advance(1);reloaded.tick();await drain();
+  assert.equal(reloaded.reloads,1);assert.equal(reloaded.history,undefined);
+  await check(reloaded);reloaded.tick();await drain();
+  assert.equal(reloaded.reloads,1);assert.equal(reloaded.history,undefined,'the old DOM cannot be scanned while the reload is pending');
+  const fresh=harness({configured:true,initialStorage:reloaded.storage,startTime:reloaded.now});await drain();
+  assert.equal(fresh.history.sent,2,'a new page can resume with a fresh scan after the cooldown');
+});
+
+test('temporary API errors share the persisted scanner breaker across three page loads and stop at the third failure',async()=>{
+  let storage,now='2026-10-03T10:00:00Z';
+  for(let count=1;count<=3;count++){
+    const app=harness({configured:true,initialStorage:storage,startTime:now});
+    await app.simulateFetch({status:503});await drain();
+    assert.equal(app.history,undefined);assert.equal(app.storage.get(app.prefix+'scanFailure').count,count);
+    await app.simulateFetch({status:503});await drain();
+    assert.equal(app.storage.get(app.prefix+'scanFailure').count,count,'several errors during the same hold count as one failed attempt');
+    if(count<3){
+      const until=app.storage.get(app.prefix+'networkHold').retryAt;
+      assert.ok(until-app.now >= (count===1 ? 59000 : 119000));
+      app.advance(until-app.now);app.tick();await drain();
+      assert.equal(app.reloads,1);assert.equal(app.messages.length,0);
+      storage=app.storage;now=app.now;
+    }else{
+      assert.equal(app.storage.get(app.prefix+'scanFailure').paused,true);assert.equal(app.messages.length,1);
+      app.advance(3600000);app.tick();await drain();
+      assert.equal(app.reloads,0);assert.equal(app.messages.length,1);assert.equal(app.history,undefined);
+      assert.equal(app.document.querySelector('#h2s-monitor-check').disabled,false,'manual recovery becomes available after the network wait');
+      app.menus.get('恢复故障暂停并立即检查')();await drain();
+      assert.equal(app.reloads,1,'explicit fault recovery reloads before a new scan');
+      assert.equal(app.storage.get(app.prefix+'networkHold'),null);
+      assert.equal(app.storage.get(app.prefix+'scanFailure')?.count || 0,0);
+      assert.equal(app.history,undefined);
+    }
+  }
+});
+
+test('an API 429 cannot bypass an already-paused scanner breaker when its wait expires',async()=>{
+  const prefix='h2s_single_city_den_haag:';
+  const app=harness({initialStorage:new Map([[prefix+'scanFailure',{count:3,paused:true,retryAt:0,noticeSent:true,reason:'Repeated failure'}]])});
+  await app.simulateFetch({status:429,headers:{'Retry-After':'600'}});await drain();
+  const until=app.storage.get(prefix+'networkHold').retryAt;
+  app.advance(until-app.now);app.tick();await drain();
+  assert.equal(app.reloads,0);assert.equal(app.history,undefined);
+  assert.equal(app.storage.get(prefix+'scanFailure').paused,true);
+});
+
+test('API challenge and 403 holds survive reload until the explicit interface-recovery menu reloads the page',async()=>{
+  for(const headers of [{},{'cf-mitigated':'challenge'}]){
+    const app=harness({configured:true});await app.simulateFetch({status:403,headers});await drain();
+    const reloaded=harness({configured:true,initialStorage:app.storage,startTime:app.now});await drain();
+    await check(reloaded);assert.equal(reloaded.reloads,0);assert.equal(reloaded.history,undefined);
+    reloaded.menus.get('恢复接口暂停（验证完成后）')();await drain();
+    assert.equal(reloaded.reloads,1);assert.equal(reloaded.history,undefined);
+    assert.equal(reloaded.storage.get(reloaded.prefix+'networkHold'),null);
+    const fresh=harness({configured:true,initialStorage:reloaded.storage,startTime:reloaded.now});await drain();
+    assert.equal(fresh.history.sent,2);
+  }
 });

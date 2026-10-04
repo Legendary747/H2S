@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.10
+// @version      1.3.11
 // @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -10,17 +10,18 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      api.telegram.org
-// @run-at       document-idle
+// @grant        unsafeWindow
+// @run-at       document-start
 // @noframes
 // ==/UserScript==
 
-(() => {
+(async () => {
   'use strict';
 
   // Without a City filter, scan all cities by ascending price and locally match this list.
   // With one City selected, scan only that city if it belongs to this list.
   const TARGET_CITIES = ['The Hague', 'Rijswijk', 'Rotterdam', 'Leiden', 'Zoetermeer'];
-  const MAX_RENT = 1000;
+  const DEFAULT_MAX_RENT = 1000;
   // Keep the original @name and prefix so an in-place update preserves Telegram configuration.
   const STORAGE_PREFIX = 'h2s_single_city_den_haag';
   const TIME_ZONE = 'Europe/Amsterdam';
@@ -60,6 +61,17 @@
     }
     const result = Number(number);
     return Number.isFinite(result) && result >= 0 ? result : null;
+  }
+  function parseBudget(value) {
+    const input = String(value ?? '').trim();
+    if (!/^\d+(?:[.,]\d{1,2})?$/.test(input)) return null;
+    const amount = Number(input.replace(',', '.'));
+    return Number.isFinite(amount) && amount > 0 && amount <= 100000 ? Math.round(amount * 100) / 100 : null;
+  }
+  function nextScanFailure(previous, reason, now) {
+    const count = Math.min(3, Math.max(0, Number(previous?.count) || 0) + 1);
+    return {count, retryAt: count < 3 ? now + count * 60000 : 0, paused: count >= 3,
+      reason, noticeSent: false, noticeRetryAt: 0};
   }
   function rentFromText(value) {
     const matches = [...clean(value).matchAll(/€\s*([\d.,\s]+?)\s*per month excl\.?\s*\*?/gi)];
@@ -384,18 +396,184 @@
     return sent;
   }
 
+  // Observe only existing first-party data traffic. Never read bodies or issue a request.
+  function h2sDataUrl(value, baseUrl = 'https://www.holland2stay.com/residences') {
+    try {
+      if (typeof value !== 'string' || !value.trim()) return null;
+      const url = new URL(value, baseUrl);
+      if (url.protocol !== 'https:' || !['holland2stay.com', 'www.holland2stay.com'].includes(url.hostname)) return null;
+      if (url.port && url.port !== '443') return null;
+      if (!/^\/(?:graphql|rest|api|residences)(?:\/|$)/i.test(url.pathname)) return null;
+      return url;
+    } catch { return null; }
+  }
+  function h2sRetryAt(value, now) {
+    const header = typeof value === 'string' ? value.trim() : '';
+    const deadline = /^\d+$/.test(header) ? now + Number(header) * 1000
+      : /^[A-Za-z]{3,9}(?:,|\s)/.test(header) ? Date.parse(header) : NaN;
+    return Number.isFinite(deadline) ? Math.max(now, deadline) : now + 60000;
+  }
+  function classifyH2SResponse(response, now = Date.now(), baseUrl) {
+    const url = h2sDataUrl(response.url, baseUrl);
+    if (!url) return null;
+    const header = name => { try { return String(response.getHeader?.(name) || ''); } catch { return ''; } };
+    const status = Number(response.status) || 0;
+    const info = {url: url.origin + url.pathname, status};
+    if (header('cf-mitigated').trim().toLowerCase() === 'challenge') return {...info, kind: 'challenge', retryAt: 0};
+    if (status === 429) return {...info, kind: 'rate-limit', retryAt: h2sRetryAt(header('Retry-After'), now)};
+    if (status === 403) return {...info, kind: 'blocked', retryAt: 0};
+    if (status >= 500 && status <= 599 || response.networkError) return {...info, kind: 'temporary', retryAt: now + 60000};
+    return null;
+  }
+  function installH2SNetworkObserver(page, onSignal, options = {}) {
+    const capabilities = {fetch: false, xhr: false, cleanup: () => {}};
+    const undo = [];
+    let active = true;
+    const baseUrl = options.baseUrl || 'https://www.holland2stay.com/residences';
+    const now = options.now || Date.now;
+    const inputUrl = input => {
+      try {
+        if (typeof input === 'string') return input;
+        if (input && typeof input.url === 'string') return input.url; // Request
+        if (input && typeof input.href === 'string') return input.href; // URL
+      } catch {}
+      return '';
+    };
+    const report = response => {
+      if (!active) return;
+      try { const signal = classifyH2SResponse(response, now(), baseUrl); if (signal) onSignal(signal); } catch {}
+    };
+    try {
+      const original = page.fetch;
+      if (typeof original === 'function') {
+        const wrapped = function (...args) {
+          const result = Reflect.apply(original, this, args);
+          const requestUrl = inputUrl(args[0]);
+          if (h2sDataUrl(requestUrl, baseUrl)) {
+            // Attach a side observer and return the original promise, preserving its
+            // identity, response, rejection, and body ownership for the application.
+            try {
+              result.then(response => {
+                try {
+                  report({url: response.url || requestUrl, status: response.status, getHeader: name => response.headers.get(name)});
+                } catch {}
+              }, error => {
+                try { if (error?.name !== 'AbortError') report({url: requestUrl, status: 0, networkError: true}); } catch {}
+              });
+            } catch {}
+          }
+          return result;
+        };
+        page.fetch = wrapped;
+        capabilities.fetch = page.fetch === wrapped;
+        if (capabilities.fetch) undo.push(() => { if (page.fetch === wrapped) page.fetch = original; });
+      }
+    } catch {}
+    try {
+      const prototype = page.XMLHttpRequest?.prototype;
+      if (prototype && typeof prototype.open === 'function' && typeof prototype.send === 'function') {
+        const open = prototype.open;
+        const send = prototype.send;
+        const requests = new WeakMap();
+        const wrappedOpen = function (...args) {
+          const result = Reflect.apply(open, this, args);
+          requests.set(this, inputUrl(args[1]));
+          return result;
+        };
+        const wrappedSend = function (...args) {
+          const requestUrl = requests.get(this);
+          let detach = () => {};
+          if (h2sDataUrl(requestUrl, baseUrl)) {
+            try {
+              const xhr = this;
+              let aborted = false;
+              let failed = false;
+              const abort = () => { aborted = true; };
+              const fail = () => { failed = true; };
+              const done = () => {
+                detach();
+                if (aborted) return;
+                try {
+                  report({url: xhr.responseURL || requestUrl, status: xhr.status,
+                    getHeader: name => xhr.getResponseHeader(name), networkError: failed});
+                } catch {}
+              };
+              detach = () => {
+                for (const [event, listener] of [['abort', abort], ['error', fail], ['timeout', fail], ['loadend', done]]) {
+                  try { xhr.removeEventListener(event, listener); } catch {}
+                }
+              };
+              try {
+                xhr.addEventListener('abort', abort);
+                xhr.addEventListener('error', fail);
+                xhr.addEventListener('timeout', fail);
+                xhr.addEventListener('loadend', done);
+              } catch { detach(); }
+            } catch {}
+          }
+          try { return Reflect.apply(send, this, args); }
+          catch (error) { detach(); throw error; }
+        };
+        // Install atomically where possible; never leave a half-installed hook.
+        try {
+          prototype.open = wrappedOpen;
+          prototype.send = wrappedSend;
+          capabilities.xhr = prototype.open === wrappedOpen && prototype.send === wrappedSend;
+        } catch {}
+        if (!capabilities.xhr) {
+          try { if (prototype.open === wrappedOpen) prototype.open = open; } catch {}
+          try { if (prototype.send === wrappedSend) prototype.send = send; } catch {}
+        } else undo.push(() => {
+          if (prototype.open === wrappedOpen) prototype.open = open;
+          if (prototype.send === wrappedSend) prototype.send = send;
+        });
+      }
+    } catch {}
+    capabilities.cleanup = () => {
+      active = false;
+      for (const restore of undo) { try { restore(); } catch {} }
+    };
+    return capabilities;
+  }
+
   // The userscript is also directly importable by the offline regression tests.
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {cityKey, cityKeys, matchesCity, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
       filterState, sortChoice, isAscendingPrice, isPriceChoice, priceSortState, forgetPriceSort, sortOptions, challenge, withinHours, validateSweep, validateBudgetSweep,
-      cityScope, historyFrom, freshState, reconcile, deliverPending};
+      cityScope, historyFrom, freshState, reconcile, deliverPending, parseBudget, nextScanFailure,
+      h2sDataUrl, h2sRetryAt, classifyH2SResponse, installH2SNetworkObserver};
     return;
   }
   if (!/^\/residences\/?$/.test(location.pathname)) return; // Never run on a booking/detail page.
 
+  // Start observing before DOM setup, using the page realm rather than the userscript realm.
+  // Buffer startup signals until this tab obtains the monitor lock.
+  const earlyNetworkSignals = [];
+  const bufferNetworkSignal = signal => {
+    earlyNetworkSignals.push({...signal, observedAt: Date.now()});
+    if (earlyNetworkSignals.length > 20) earlyNetworkSignals.shift();
+  };
+  let networkReceiver = bufferNetworkSignal;
+  let pageWindow;
+  try { pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window; } catch { pageWindow = window; }
+  const networkObserver = installH2SNetworkObserver(pageWindow, signal => networkReceiver(signal),
+    {now: () => Date.now(), baseUrl: location.origin + location.pathname});
+  if (document.readyState === 'loading') {
+    await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, {once: true}));
+  }
+
   const key = name => STORAGE_PREFIX + ':' + name;
   const get = (name, fallback) => GM_getValue(key(name), fallback);
   const set = (name, value) => GM_setValue(key(name), value);
+  const maxRent = () => parseBudget(get('maxRent', DEFAULT_MAX_RENT)) ?? DEFAULT_MAX_RENT;
+  const readScanFailure = () => get('scanFailure', null) || {count: 0, retryAt: 0, paused: false};
+  const telegramCooldownUntil = () => Math.max(0, Number(get('telegramCooldownUntil', 0)) || 0);
+  function postponeTelegram(seconds = 60) {
+    const until = Math.max(telegramCooldownUntil(), Date.now() + Math.max(1, seconds) * 1000);
+    set('telegramCooldownUntil', until);
+    return until;
+  }
+  function cancelledError(message) { const error = Error(message); error.cancelled = true; return error; }
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const formatTime = value => value ? new Intl.DateTimeFormat('zh-CN', {timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'}).format(new Date(value)) : '—';
   let scanRunning = false;
@@ -406,10 +584,10 @@
   let retryAt = 0;
   let dirty = true;
   let lastScope = '';
-  let nextTelegramAttempt = 0;
-  let retryNoticeAt = 0;
+  let telegramQueue = Promise.resolve();
   let daytime = withinHours();
   let maintenanceUntil = 0;
+  let networkRefreshPending = false;
   const stats = {message: '正在启动', phase: '未开始', sortStep: '', mode: '', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
   const panelColors = {normal: '#e6edf5', muted: '#a6b8cb', info: '#7dd3fc', success: '#86efac', warning: '#fcd34d', error: '#fda4af'};
   const panelBackgrounds = {normal: '#162638', muted: '#162638', info: '#142d41', success: '#16332f', warning: '#352d20', error: '#38232e'};
@@ -453,10 +631,10 @@
   function configured() { return Boolean(get('token', '') && get('chatId', '')); }
   const readHistory = () => historyFrom(get('state', null));
   const targetsFor = filters => filters.allCities ? TARGET_CITIES : filters.city ? [filters.city] : [];
-  const scopeFor = filters => JSON.stringify(['price-asc-v1', filters.allCities ? '*' : cityKey(filters.city), MAX_RENT,
+  const scopeFor = filters => JSON.stringify(['price-asc-v1', filters.allCities ? '*' : cityKey(filters.city), maxRent(),
     ...(filters.availability ? ['availability:' + filters.availability] : [])]);
   const queuedItems = (history, filters) => Object.values(history.cities).flatMap(state => Object.values(state.items))
-    .filter(item => item.pending && item.eligible && !item.missing && item.rent <= MAX_RENT && matchesCity(item.city, targetsFor(filters)));
+    .filter(item => item.pending && item.eligible && !item.missing && item.rent <= maxRent() && matchesCity(item.city, targetsFor(filters)));
   function sortingStatus(sorting, mode, filters) {
     if (mode === 'single') return '当前仅一页，无需排序';
     if (sorting.ok) return 'Price · 从低到高';
@@ -471,7 +649,7 @@
       return stats.sortStep === 'Price · 从低到高' ? 'Price 状态已变化，等待重新确认' : stats.sortStep;
     }
     if (scanRunning) return '尚未操作：先等待房源列表稳定';
-    if (stats.phase === '扫描未完成') return '尚未操作：本轮在排序前停止，见下方原因';
+    if (['扫描未完成', '扫描失败，等待重试', '故障暂停'].includes(stats.phase)) return '尚未操作：本轮在排序前停止，见下方原因';
     return '尚未开始；扫描启动后自动选择 Price';
   }
   function notificationSummary(history, filters, previous, pending, sameScope) {
@@ -483,12 +661,12 @@
     if (!configured()) return 'Telegram 尚未配置；需要通知的房源会保留在待发队列。';
     if (pending) return '当前有 ' + pending + ' 条待发；发送或重试进度见扫描状态。';
     if (scanRunning) return '完成扫描后核对通知；已成功通知且无变化的房源不重发。';
-    if (sameScope && stats.phase === '扫描未完成') return '本轮扫描未完成验证，没有生成新的房源通知。';
+    if (sameScope && ['扫描未完成', '扫描失败，等待重试', '故障暂停'].includes(stats.phase)) return '本轮扫描未完成验证，没有生成新的房源通知。';
     if (!previous) return '尚无当前范围的完整扫描；立即检查会扫描，测试 Telegram 仅检查消息通道。';
     if (sameScope && stats.sent) return '本轮已成功发送 ' + stats.sent + ' 条；重复检查不会重复发送未变化的房源。';
     if (!previous.matched) return '上次完整扫描没有符合城市、预算和可订条件的房源。';
     const eligible = Object.values(history.cities).flatMap(state => Object.values(state.items))
-      .filter(item => item.eligible && !item.missing && item.rent <= MAX_RENT && matchesCity(item.city, targetsFor(filters)));
+      .filter(item => item.eligible && !item.missing && item.rent <= maxRent() && matchesCity(item.city, targetsFor(filters)));
     const silent = eligible.some(item => item.initialNoticeSkipped && item.lastNotified == null);
     if (silent) return '当前无待发通知；静默基线中的房源不首发，已通知且无变化的房源不重发。';
     if (eligible.length && eligible.every(item => item.lastNotified != null)) return '符合房源已通知过；本轮没有需要新发的通知。';
@@ -508,8 +686,8 @@
       : /暂停|重试/.test(phase) ? 'warning' : scanRunning || deliveryRunning ? 'info' : /完成/.test(phase) ? 'success' : 'muted';
     const header = panelNode('div', null, {display: 'flex', alignItems: 'center', justifyContent: 'space-between'});
     header.append(panelNode('strong', 'H2S', {fontSize: '21px', color: '#f0f9ff', letterSpacing: '0.5px'}),
-      panelNode('span', 'v1.3.10', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
-    const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + MAX_RENT, {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
+      panelNode('span', 'v1.3.11', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
+    const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + maxRent(), {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
     const statusCard = panelNode('div', null, {background: panelBackgrounds[tone], borderLeft: '3px solid ' + panelColors[tone],
       borderRadius: '8px', padding: '9px 11px', marginBottom: '10px'});
     statusCard.append(panelNode('div', '扫描状态：' + phase, {color: panelColors[tone], fontWeight: '700', fontSize: '13px'}),
@@ -524,6 +702,11 @@
       panelRow('目标城市', filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认', 'muted'),
       panelRow('筛选条件', filters.ok ? '通过' : '未通过；' + filters.reason, filters.ok ? 'success' : 'warning'),
       panelRow('价格排序', sortingStatus(sorting, mode, filters), sorting.ok || mode === 'single' ? 'success' : 'warning'));
+    if (readScanFailure().count) details.append(panelRow('故障状态', readScanFailure().paused ? '已暂停；请手动恢复' : '连续失败 ' + readScanFailure().count + '/3', 'warning'));
+    if (telegramCooldownUntil() > Date.now()) details.append(panelRow('通知等待', '最早重试 ' + formatTime(telegramCooldownUntil()), 'warning'));
+    details.append(panelRow('接口观察', networkObserver.fetch && networkObserver.xhr ? '已接入 fetch / XHR'
+      : networkObserver.fetch || networkObserver.xhr ? '部分可用；其余依赖页面检查' : '不可用；仅使用页面检查',
+      networkObserver.fetch && networkObserver.xhr ? 'muted' : 'warning'));
     if (mode === 'city') details.append(panelRow('扫描方式', '读完当前城市全部页，再按预算筛选', 'info'));
     if (others > 0) details.append(panelNode('div', '其他城市 / 范围待复查 ' + others + ' 条', {color: panelColors.warning}));
     const telegramLabel = configured() ? stats.telegram === '未配置' ? '已配置' : stats.telegram : '未配置（菜单设置）';
@@ -543,27 +726,33 @@
     const hours = panelNode('div', '自动运行 ' + String(START_HOUR).padStart(2, '0') + ':00–' + String(END_HOUR).padStart(2, '0') +
       ':00 荷兰时间', {color: panelColors.muted, fontSize: '11px'});
     panelText.replaceChildren(header, budget, statusCard, counts, details, notification, footer, refresh, hours);
-    checkButton.disabled = !isLeader || scanRunning || deliveryRunning || get('paused', false) || !filters.ok || challenge(document);
+    checkButton.textContent = readScanFailure().paused ? '恢复并立即检查' : '立即检查（夜间也可运行）';
+    const hold = readNetworkHold();
+    const canRecoverTemporary = hold?.kind === 'temporary' && readScanFailure().paused && Date.now() >= hold.retryAt;
+    checkButton.disabled = !isLeader || scanRunning || deliveryRunning || get('paused', false) || !filters.ok || challenge(document)
+      || (Boolean(hold) && !canRecoverTemporary) || networkRefreshPending;
     checkButton.style.opacity = checkButton.disabled ? '0.55' : '1';
     checkButton.style.cursor = checkButton.disabled ? 'not-allowed' : 'pointer';
   }
   function setMessage(message) { stats.message = message; render(); }
   function setStatus(phase, message) { stats.phase = phase; setMessage(message); }
-  function scheduleRefresh() { nextRefresh = Date.now() + (REFRESH_MINUTES[0] + Math.random() * (REFRESH_MINUTES[1] - REFRESH_MINUTES[0])) * 60000; }
+  function scheduleRefresh() { nextRefresh = readScanFailure().paused ? 0 : Date.now() + (REFRESH_MINUTES[0] + Math.random() * (REFRESH_MINUTES[1] - REFRESH_MINUTES[0])) * 60000; }
   function filtersFingerprint() {
     return scopeFor(filterState(document));
   }
   function assertRunning(manual, sending = false) {
-    if (!isLeader || get('paused', false)) throw Error('监控已暂停');
-    if (challenge(document)) throw Error('检测到验证页面，已停止操作');
-    if (!manual && !withinHours()) throw Error('已进入夜间暂停时段');
-    if (!sending && Date.now() < maintenanceUntil) throw Error('检测到手动操作，等待 30 秒后继续扫描');
+    if (readNetworkHold() || networkRefreshPending) throw cancelledError('房源接口受阻，等待处理后重新加载');
+    if (!isLeader || get('paused', false)) throw cancelledError('监控已暂停');
+    if (readScanFailure().paused) throw cancelledError('连续扫描失败，监控已故障暂停');
+    if (challenge(document)) throw cancelledError('检测到验证页面，已停止操作');
+    if (!manual && !withinHours()) throw cancelledError('已进入夜间暂停时段');
+    if (!sending && Date.now() < maintenanceUntil) throw cancelledError('检测到手动操作，等待 30 秒后继续扫描');
   }
   function assertScope(scope, manual, sending = false) {
     assertRunning(manual, sending);
     const filters = filterState(document);
-    if (!filters.ok) throw Error(filters.reason);
-    if (filtersFingerprint() !== scope) throw Error('筛选条件已改变；本轮已取消');
+    if (!filters.ok) throw cancelledError(filters.reason);
+    if (filtersFingerprint() !== scope) throw cancelledError('筛选条件已改变；本轮已取消');
   }
   function assertAllowed(scope, manual, requireAscending = false) {
     assertScope(scope, manual);
@@ -650,33 +839,53 @@
       setMessage(lastError + '（已等待 ' + Math.floor((Date.now() - start) / 1000) + ' 秒 / 最多 ' + MAX_SETTLE_MS / 1000 + ' 秒）');
       await sleep(1000);
     }
-    throw Error(lastError + '；本轮未完成，后续页面变化会重试');
+    throw Error(lastError + '；本轮未完成，将按退避间隔重试');
   }
-  async function telegram(method, payload) {
+  function telegram(method, payload, allowed = () => {}) {
+    // Serialize this tab's requests so a just-received rate limit also covers
+    // a queued test, pairing request, or incident notification.
+    const task = telegramQueue.then(() => { allowed(); return requestTelegram(method, payload); });
+    telegramQueue = task.catch(() => {});
+    return task;
+  }
+  async function requestTelegram(method, payload) {
+    const remaining = telegramCooldownUntil() - Date.now();
+    if (remaining > 0) {
+      const error = Error('Telegram 等待重试，最早 ' + formatTime(telegramCooldownUntil()));
+      error.retryAfter = Math.ceil(remaining / 1000);
+      throw error;
+    }
     const token = get('token', '');
     if (!/^\d+:[\w-]{20,}$/.test(token)) throw Error('请先在菜单配置 Telegram Token');
     return new Promise((resolve, reject) => {
+      const fail = (message, retryAfter = 60) => {
+        const error = Error(message);
+        error.retryAfter = retryAfter;
+        postponeTelegram(retryAfter);
+        reject(error);
+      };
       GM_xmlhttpRequest({method: 'POST', url: 'https://api.telegram.org/bot' + token + '/' + method,
         headers: {'Content-Type': 'application/json'}, data: JSON.stringify(payload), anonymous: true, timeout: 15000,
         onload(response) {
           let body;
-          try { body = JSON.parse(response.responseText); } catch { reject(Error('Telegram 返回无法解析的响应')); return; }
-          if (response.status === 200 && body.ok === true) resolve(body.result);
+          try { body = JSON.parse(response.responseText); }
+          catch { fail('Telegram 返回无法解析的响应'); return; }
+          if (response.status === 200 && body?.ok === true) resolve(body.result);
           else {
-            const error = Error('Telegram HTTP ' + response.status + '；请核对配置或稍后重试');
-            error.retryAfter = Number(body.parameters?.retry_after) || 60;
-            reject(error);
+            const seconds = Number(body?.parameters?.retry_after);
+            const retryAfter = Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : 60;
+            fail('Telegram HTTP ' + response.status + '；请核对配置或稍后重试', retryAfter);
           }
         },
-        onerror: () => reject(Error('Telegram 网络错误，通知保留待重试')),
-        ontimeout: () => reject(Error('Telegram 超时，通知保留待重试')),
-        onabort: () => reject(Error('Telegram 请求中止，通知保留待重试'))});
+        onerror: () => fail('Telegram 网络错误，通知保留待重试'),
+        ontimeout: () => fail('Telegram 超时，通知保留待重试'),
+        onabort: () => fail('Telegram 请求中止，通知保留待重试')});
     });
   }
-  async function sendText(message) {
+  async function sendText(message, allowed) {
     const chatId = get('chatId', '');
     if (!/^-?\d+$/.test(String(chatId))) throw Error('请先配置 Telegram Chat ID');
-    await telegram('sendMessage', {chat_id: chatId, text: message, link_preview_options: {is_disabled: true}});
+    await telegram('sendMessage', {chat_id: chatId, text: message, link_preview_options: {is_disabled: true}}, allowed);
   }
   function listingMessage(item) {
     return ['H2S · ' + item.pending.reason, item.title, '城市：' + item.city,
@@ -689,16 +898,45 @@
     setStatus('验证暂停', '遇到验证/访问受阻，请在当前页手动处理；自动刷新已停');
     const incident = get('incident', null) || {started: Date.now(), sent: false};
     set('incident', incident);
-    if (incident.sent || !configured() || Date.now() < retryNoticeAt) return;
-    retryNoticeAt = Date.now() + 60000;
+    if (incident.sent || !configured() || Date.now() < Math.max(incident.retryAt || 0, telegramCooldownUntil())) return;
+    incident.retryAt = Date.now() + 60000;
+    set('incident', incident);
     try {
       await sendText('H2S · ' + CITY_LABEL + '\n监控遇到验证或访问受阻，已暂停自动刷新。请在运行脚本的浏览器中手动处理。\n' + location.origin + location.pathname);
       incident.sent = true;
       set('incident', incident);
-    } catch { stats.telegram = '验证提醒发送失败，稍后重试'; render(); }
+    } catch (error) {
+      incident.retryAt = Math.max(incident.retryAt, telegramCooldownUntil());
+      set('incident', incident);
+      stats.telegram = '验证提醒发送失败；最早重试 ' + formatTime(incident.retryAt); render();
+    }
+  }
+  async function notifyScanFailure() {
+    const failure = readScanFailure();
+    if (!failure.paused) return;
+    nextRefresh = 0;
+    deliveryContext = null;
+    const hold = readNetworkHold();
+    const recovery = hold && hold.kind !== 'temporary' ? '处理后使用“恢复接口暂停（验证完成后）”菜单'
+      : hold ? '接口等待到 ' + formatTime(hold.retryAt) + ' 后，点“恢复并立即检查”' : '处理后点“恢复并立即检查”或菜单恢复';
+    setStatus('故障暂停', '连续 ' + failure.count + ' 次扫描失败：' + failure.reason + '；' + recovery);
+    if (failure.noticeSent || !configured() || Date.now() < Math.max(failure.noticeRetryAt || 0, telegramCooldownUntil())) return;
+    failure.noticeRetryAt = Date.now() + 60000;
+    set('scanFailure', failure);
+    try {
+      await sendText('H2S · 监控故障暂停\n连续 ' + failure.count + ' 次扫描失败，已停止自动扫描和刷新。\n原因：' + failure.reason +
+        '\n请在原浏览器检查页面，处理后选择“恢复故障暂停并立即检查”。\n' + location.origin + location.pathname);
+      // A manual recovery during the request must not revive an old incident.
+      if (readScanFailure().paused) { failure.noticeSent = true; set('scanFailure', failure); }
+      stats.telegram = '故障提醒发送成功';
+    } catch (error) {
+      failure.noticeRetryAt = Math.max(failure.noticeRetryAt, telegramCooldownUntil());
+      if (readScanFailure().paused) set('scanFailure', failure);
+      stats.telegram = '故障提醒发送失败；最早重试 ' + formatTime(failure.noticeRetryAt); render();
+    }
   }
   async function flushPending(context) {
-    if (deliveryRunning || !configured() || Date.now() < nextTelegramAttempt) return;
+    if (deliveryRunning || !configured() || Date.now() < telegramCooldownUntil()) return;
     const filters = filterState(document);
     const history = readHistory();
     const queue = queuedItems(history, filters);
@@ -712,10 +950,9 @@
         // Pagination clicks do not invalidate an already verified snapshot. Changing
         // the selected city, pausing, or encountering a challenge still stops delivery.
         assertScope(context.scope, context.manual, true);
-        try { await sendText(listingMessage(item)); }
-        catch (error) { error.telegramFailure = true; throw error; }
+        try { await sendText(listingMessage(item), () => assertScope(context.scope, context.manual, true)); }
+        catch (error) { if (!error.cancelled) error.telegramFailure = true; throw error; }
         stats.telegram = '发送成功';
-        nextTelegramAttempt = 0;
       }, (value, item) => {
         const latest = readHistory();
         const city = latest.cities[cityKey(item.city)];
@@ -730,21 +967,123 @@
       setStatus('本轮已完成', '预算内扫描完成；本轮已发 ' + stats.sent + ' 条');
     } catch (error) {
       if (error.telegramFailure) {
-        nextTelegramAttempt = Date.now() + Math.max(60, error.retryAfter || 60) * 1000;
+        postponeTelegram(error.retryAfter || 60);
         stats.telegram = error.message;
-        setStatus('通知等待重试（扫描已完成）', '待发记录已保留；最早重试 ' + formatTime(nextTelegramAttempt));
+        setStatus('通知等待重试（扫描已完成）', '待发记录已保留；最早重试 ' + formatTime(telegramCooldownUntil()));
       } else {
         deliveryContext = null;
         setStatus('通知已暂停（扫描已完成）', error.message + '；待发记录已保留');
       }
     } finally { deliveryRunning = false; render(); }
   }
+  const readNetworkHold = () => get('networkHold', null);
+  function networkDescription(hold) {
+    if (hold.kind === 'challenge') return '房源接口返回验证页面；请手动完成验证后使用“恢复接口暂停（验证完成后）”';
+    if (hold.kind === 'blocked') return '房源接口返回 HTTP 403；请检查官网拒绝访问原因，处理后使用恢复接口菜单';
+    if (hold.kind === 'rate-limit') return '房源接口返回 HTTP 429；最早 ' + formatTime(hold.retryAt) + ' 后重新加载';
+    return '房源接口' + (hold.status ? '返回 HTTP ' + hold.status : '网络请求失败') + '；等待后重新加载';
+  }
+  async function applyNetworkSignal(signal) {
+    const previous = readNetworkHold();
+    const priority = kind => ({temporary: 1, 'rate-limit': 2, blocked: 3, challenge: 4})[kind] || 0;
+    if (previous && priority(previous.kind) >= priority(signal.kind)) {
+      if (previous.kind === signal.kind && signal.retryAt > previous.retryAt) {
+        previous.retryAt = signal.retryAt;
+        set('networkHold', previous);
+      }
+      return;
+    }
+    const hold = {...signal, started: Date.now(), noticeSent: false, noticeRetryAt: 0,
+      retryAt: ['temporary', 'rate-limit'].includes(signal.kind) ? Math.max(Date.now() + 60000, signal.retryAt) : 0};
+    set('networkHold', hold);
+    nextRefresh = 0;
+    deliveryContext = null;
+    dirty = true;
+    if (hold.kind === 'temporary') {
+      await recordScanFailure(Error(networkDescription(hold)));
+      // The second transient failure uses the shared 120-second backoff.
+      const latest = readNetworkHold();
+      if (latest?.started === hold.started && latest.kind === hold.kind) {
+        latest.retryAt = Math.max(latest.retryAt, readScanFailure().retryAt || 0);
+        set('networkHold', latest);
+      }
+    } else setStatus(hold.kind === 'rate-limit' ? '接口限流等待' : '接口验证暂停', networkDescription(hold));
+  }
+  async function notifyNetworkHold(hold) {
+    if (hold.kind === 'temporary' || hold.noticeSent || !configured()
+      || Date.now() < Math.max(hold.noticeRetryAt || 0, telegramCooldownUntil())) return;
+    hold.noticeRetryAt = Date.now() + 60000;
+    set('networkHold', hold);
+    try {
+      await sendText('H2S · 接口暂停\n' + networkDescription(hold) + '\n' + hold.url);
+      const latest = readNetworkHold();
+      if (latest?.started === hold.started && latest.kind === hold.kind) {
+        latest.noticeSent = true;
+        set('networkHold', latest);
+      }
+      stats.telegram = '接口提醒发送成功';
+    } catch {
+      const latest = readNetworkHold();
+      if (latest?.started === hold.started && latest.kind === hold.kind) {
+        latest.noticeRetryAt = Math.max(latest.noticeRetryAt, telegramCooldownUntil());
+        set('networkHold', latest);
+      }
+      stats.telegram = '接口提醒等待重试';
+    }
+  }
+  async function serviceNetworkHold(manual = false) {
+    if (networkRefreshPending) { setStatus('等待重新加载', '接口等待已结束，正在重新加载以确认最新房源'); return true; }
+    const hold = readNetworkHold();
+    if (!hold) return false;
+    nextRefresh = 0;
+    deliveryContext = null;
+    if (readScanFailure().paused) { await notifyScanFailure(); return true; }
+    if (hold.retryAt && Date.now() >= hold.retryAt) {
+      if (!manual && !withinHours()) { setStatus('夜间暂停', '接口等待已结束；白天重新加载，或使用恢复接口菜单'); return true; }
+      // Do not accept the old, still-visible cards as fresh data after an API failure.
+      set('networkHold', null);
+      networkRefreshPending = true;
+      setStatus('等待重新加载', '接口等待已结束，正在重新加载以确认最新房源');
+      location.reload();
+      return true;
+    }
+    setStatus(hold.retryAt ? '接口等待重试' : '接口验证暂停', networkDescription(hold));
+    await notifyNetworkHold(hold);
+    return true;
+  }
+  async function recordScanFailure(error) {
+    nextRefresh = 0;
+    deliveryContext = null;
+    dirty = true;
+    const previous = readScanFailure();
+    if (previous.paused) return previous;
+    const failure = nextScanFailure(previous, error.message || String(error), Date.now());
+    set('scanFailure', failure);
+    retryAt = Math.max(failure.retryAt, maintenanceUntil);
+    if (failure.paused) await notifyScanFailure();
+    else setStatus('扫描失败，等待重试', '连续失败 ' + failure.count + '/3：' + failure.reason + '；最早重试 ' + formatTime(retryAt));
+    return failure;
+  }
   async function runScan(manual = false) {
     if (scanRunning || deliveryRunning || !isLeader || get('paused', false)) return;
     if (challenge(document)) { await notifyBlock(); return; }
+    const hold = readNetworkHold();
+    if (manual && hold?.kind === 'temporary' && readScanFailure().paused && Date.now() >= hold.retryAt) {
+      set('networkHold', null);
+      set('scanFailure', null);
+      networkRefreshPending = true;
+      location.reload();
+      return;
+    }
+    if ((readNetworkHold() || networkRefreshPending) && await serviceNetworkHold(manual)) return;
     const filters = filterState(document);
     if (!filters.ok) { nextRefresh = 0; setStatus('未开始', filters.reason); return; }
     if (!manual && !withinHours()) { nextRefresh = 0; setStatus('夜间暂停', '菜单可手动立即检查'); return; }
+    if (manual) { set('scanFailure', null); retryAt = 0; }
+    else {
+      if (readScanFailure().paused) { await notifyScanFailure(); return; }
+      if (Date.now() < Math.max(retryAt, readScanFailure().retryAt || 0)) return;
+    }
     scanRunning = true;
     dirty = false;
     deliveryContext = null;
@@ -769,7 +1108,7 @@
           throw Error('未能选中 Price：' + sorting.reason + '；请手动展开 Sort 选择 Price 后点击“立即检查”');
         }
         mode = sorting.ok ? 'budget' : 'city';
-        setStatus('已开始，等待列表稳定', mode === 'budget' ? '已选择 Price 升序，遇到主租金 > €' + MAX_RENT + ' 后停止翻页'
+        setStatus('已开始，等待列表稳定', mode === 'budget' ? '已选择 Price 升序，遇到主租金 > €' + maxRent() + ' 后停止翻页'
           : '未确认升序，将读取 ' + filters.city + ' 的全部页，再按预算筛选');
         result = await stablePage(scope, manual, undefined, null, mode === 'budget');
         if (singlePage(result)) mode = 'single';
@@ -790,17 +1129,17 @@
         if (useCutoff && listings.length && result.listings.length && result.listings[0].rent < listings[listings.length - 1].rent) throw Error('跨页价格未按升序排列；本轮不更新历史');
         listings.push(...result.listings);
         stats.scanned = listings.length;
-        stats.matched = listings.filter(item => matchesCity(item.city, targets) && item.rent <= MAX_RENT && directStatus(item.status)).length;
+        stats.matched = listings.filter(item => matchesCity(item.city, targets) && item.rent <= maxRent() && directStatus(item.status)).length;
         stats.pages = n;
         setStatus('扫描中', '正在读取第 ' + n + ' 页；当前列表共 ' + total + ' 套');
-        if ((useCutoff && result.listings.some(item => item.rent > MAX_RENT)) || !result.page.next) break;
+        if ((useCutoff && result.listings.some(item => item.rent > maxRent())) || !result.page.next) break;
         if (n === MAX_PAGES) throw Error('超过分页上限；本轮不更新历史');
         const old = fingerprint(result);
         result.page.next.click();
         result = await stablePage(scope, manual, n + 1, old, useCutoff);
       }
       let cutoff = false;
-      if (useCutoff) ({cutoff} = validateBudgetSweep(listings, total, MAX_RENT, filters.city, !result.page.next));
+      if (useCutoff) ({cutoff} = validateBudgetSweep(listings, total, maxRent(), filters.city, !result.page.next));
       else validateSweep(listings, total, filters.city);
       assertAllowed(scope, manual, useCutoff);
       const history = readHistory();
@@ -811,7 +1150,7 @@
         const key = cityKey(city);
         const previous = history.cities[key];
         const rows = listings.filter(item => matchesCity(item.city, city));
-        const {state} = reconcile(previous, rows, cityScope(city), city, MAX_RENT, Date.now(), {silentBaseline});
+        const {state} = reconcile(previous, rows, cityScope(city), city, maxRent(), Date.now(), {silentBaseline});
         if (notifyExisting) {
           for (const item of Object.values(state.items)) if (item.eligible && !item.missing) item.pending = {reason: '手动重新通知', detectedAt: Date.now()};
         }
@@ -820,6 +1159,8 @@
       history.scans ||= {};
       history.scans[scope] = {completedAt: Date.now(), inspected: listings.length, matched: stats.matched, pages: stats.pages, total, cutoff, mode};
       set('state', history);
+      set('scanFailure', null);
+      retryAt = 0;
       if (notifyExisting) set('notifyExisting', false);
       if (silentBaseline) set('silentBaseline', false);
       const completion = silentBaseline ? '已按选择建立静默记录；现有房源不通知'
@@ -833,17 +1174,25 @@
       if (withinHours()) scheduleRefresh();
       else nextRefresh = 0;
     } catch (error) {
-      setStatus('扫描未完成', error.message);
-      if (challenge(document)) await notifyBlock();
-      retryAt = Math.max(Date.now() + 60000, maintenanceUntil);
+      nextRefresh = 0;
       dirty = true;
+      if (challenge(document)) {
+        await notifyBlock();
+      } else if (error.cancelled) {
+        retryAt = Math.max(Date.now() + 2000, maintenanceUntil);
+        setStatus('扫描已取消', error.message);
+      } else {
+        await recordScanFailure(error);
+      }
     } finally { scanRunning = false; render(); }
   }
   async function tick() {
     if (!isLeader || scanRunning || deliveryRunning) return;
     if (get('paused', false)) { nextRefresh = 0; setStatus('手动暂停', '菜单可恢复'); return; }
     if (challenge(document)) { await notifyBlock(); return; }
-    if (get('incident', null)) { set('incident', null); dirty = true; retryAt = 0; }
+    if (get('incident', null)) { set('incident', null); dirty = true; }
+    if ((readNetworkHold() || networkRefreshPending) && await serviceNetworkHold()) return;
+    if (readScanFailure().paused) { await notifyScanFailure(); return; }
     const filters = filterState(document);
     if (!filters.ok) { deliveryContext = null; dirty = true; nextRefresh = 0; setStatus('未开始', filters.reason); return; }
     const scope = scopeFor(filters);
@@ -853,17 +1202,23 @@
       dirty = true; // Recheck availability before retrying an old snapshot.
     }
     if (deliveryContext && configured() && (withinHours() || deliveryContext.manual)) {
-      if (Date.now() >= nextTelegramAttempt) await flushPending(deliveryContext);
+      if (Date.now() >= telegramCooldownUntil()) await flushPending(deliveryContext);
       if (deliveryContext) {
-        setStatus('通知等待重试（扫描已完成）', '当前范围待发记录已保留；最早重试 ' + formatTime(nextTelegramAttempt));
+        setStatus('通知等待重试（扫描已完成）', '当前范围待发记录已保留；最早重试 ' + formatTime(telegramCooldownUntil()));
         return;
       }
     }
     if (!withinHours()) { daytime = false; nextRefresh = 0; setStatus('夜间暂停', '菜单可手动立即检查；待发数量保留显示'); return; }
+    const scanRetryAt = Math.max(retryAt, readScanFailure().retryAt || 0);
+    if (Date.now() < scanRetryAt) {
+      if (readScanFailure().count) setStatus('扫描失败，等待重试', '连续失败 ' + readScanFailure().count + '/3；最早重试 ' + formatTime(scanRetryAt));
+      else render();
+      return;
+    }
     if (!daytime) { daytime = true; location.reload(); return; }
     if (Date.now() < maintenanceUntil) { setStatus('等待手动操作结束', '30 秒观察期结束后继续扫描'); return; }
     if (nextRefresh && Date.now() >= nextRefresh) { location.reload(); return; }
-    if (dirty && Date.now() >= retryAt) { await runScan(); return; }
+    if (dirty && Date.now() >= scanRetryAt) { await runScan(); return; }
     render();
   }
   function safe(callback) { return (...args) => { Promise.resolve().then(() => callback(...args)).catch(error => { setMessage(error.message); }); }; }
@@ -899,8 +1254,43 @@
     set('chatId', value.trim()); dirty = true; render();
   });
   register('测试 Telegram', async () => {
-    await sendText('H2S 测试成功 · ' + CITY_LABEL + ' · 主租金 ≤ €' + MAX_RENT + '\n此消息只验证 Telegram 配置，不代表已发现新房源。');
+    await sendText('H2S 测试成功 · ' + CITY_LABEL + ' · 主租金 ≤ €' + maxRent() + '\n此消息只验证 Telegram 配置，不代表已发现新房源。');
     stats.telegram = '测试成功'; render();
+  });
+  register('恢复接口暂停（验证完成后）', () => {
+    requireIdle();
+    if (challenge(document)) throw Error('请先在官网完成验证或解决拒绝访问');
+    const hold = readNetworkHold();
+    if (!hold) throw Error('当前没有接口暂停；需要重扫时使用“立即检查”');
+    if (hold.retryAt && Date.now() < hold.retryAt) throw Error('接口仍在等待期；最早 ' + formatTime(hold.retryAt) + ' 后恢复');
+    if (!confirm('已在官网处理验证/访问问题？确认后重新加载并重新检查房源。')) return;
+    set('networkHold', null);
+    set('scanFailure', null);
+    deliveryContext = null;
+    nextRefresh = 0;
+    networkRefreshPending = true;
+    location.reload();
+  });
+  register('设置预算（主租金上限）', () => {
+    requireIdle();
+    const value = prompt('输入每月主租金上限（欧元，不含额外费用；0 < 金额 ≤ 100000，最多两位小数）：', String(maxRent()));
+    if (value === null) return;
+    const budget = parseBudget(value);
+    if (budget === null) throw Error('预算须大于 0、最高 100000 欧元，最多两位小数');
+    set('maxRent', budget);
+    deliveryContext = null;
+    lastScope = '';
+    nextRefresh = 0;
+    dirty = true;
+    retryAt = 0;
+    set('notifyExisting', false);
+    set('silentBaseline', false);
+    setStatus('预算已保存', '新预算 €' + budget + '；下次完整扫描后按新预算核对通知');
+  });
+  register('恢复故障暂停并立即检查', async () => {
+    requireIdle();
+    if (get('paused', false)) throw Error('监控同时处于手动暂停，请先通过“暂停 / 恢复”恢复');
+    await runScan(true);
   });
   register('立即检查（允许在夜间手动执行）', async () => { requireIdle(); await runScan(true); });
   register('暂停 / 恢复', () => { set('paused', !get('paused', false)); dirty = true; retryAt = 0; nextRefresh = 0; render(); });
@@ -944,7 +1334,7 @@
     });
     if (meaningful) {
       clearTimeout(debounce);
-      debounce = setTimeout(() => { dirty = true; retryAt = Math.min(retryAt, Date.now() + 2000); }, 1200);
+      debounce = setTimeout(() => { dirty = true; retryAt = Math.max(retryAt, readScanFailure().retryAt || 0, Date.now() + 2000); }, 1200);
     }
   });
   observer.observe(document.body, {childList: true, subtree: true, characterData: true});
@@ -956,7 +1346,7 @@
   }, true);
   document.addEventListener('change', event => {
     if (event.target.closest?.('#filter_accordion,[aria-label^="Filter products by "]')) {
-      dirty = true; nextRefresh = 0; retryAt = Date.now() + 2000;
+      dirty = true; nextRefresh = 0; retryAt = Math.max(readScanFailure().retryAt || 0, Date.now() + 2000);
       if (event.isTrusted) maintenanceUntil = Date.now() + 30000;
       render();
     }
@@ -967,16 +1357,22 @@
       if (!deliveryRunning) dirty = true;
     }
   });
+  networkReceiver = signal => {
+    if (!isLeader) { bufferNetworkSignal(signal); return; }
+    applyNetworkSignal(signal).catch(error => setMessage('接口状态处理失败：' + error.message));
+  };
   render();
   if (!navigator.locks) { setMessage('此浏览器不支持 Web Locks；请使用更新的 Chrome、Edge 或 Firefox'); return; }
   setMessage('等待监控锁；同一配置只允许一个标签页运行');
   navigator.locks.request('h2s-monitor:' + STORAGE_PREFIX, async () => {
     isLeader = true;
+    for (const signal of earlyNetworkSignals.splice(0)) await applyNetworkSignal(signal);
     const interval = setInterval(safe(tick), 5000);
     await tick();
     await new Promise(resolve => window.addEventListener('pagehide', resolve, {once: true}));
     clearInterval(interval);
     observer.disconnect();
+    networkObserver.cleanup();
     isLeader = false;
   }).catch(error => setMessage('监控锁异常：' + error.message));
 })();
