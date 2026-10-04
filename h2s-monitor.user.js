@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.9
+// @version      1.3.10
 // @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -20,7 +20,7 @@
   // Without a City filter, scan all cities by ascending price and locally match this list.
   // With one City selected, scan only that city if it belongs to this list.
   const TARGET_CITIES = ['The Hague', 'Rijswijk', 'Rotterdam', 'Leiden', 'Zoetermeer'];
-  const MAX_RENT = 1500;
+  const MAX_RENT = 1000;
   // Keep the original @name and prefix so an in-place update preserves Telegram configuration.
   const STORAGE_PREFIX = 'h2s_single_city_den_haag';
   const TIME_ZONE = 'Europe/Amsterdam';
@@ -508,7 +508,7 @@
       : /暂停|重试/.test(phase) ? 'warning' : scanRunning || deliveryRunning ? 'info' : /完成/.test(phase) ? 'success' : 'muted';
     const header = panelNode('div', null, {display: 'flex', alignItems: 'center', justifyContent: 'space-between'});
     header.append(panelNode('strong', 'H2S', {fontSize: '21px', color: '#f0f9ff', letterSpacing: '0.5px'}),
-      panelNode('span', 'v1.3.9', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
+      panelNode('span', 'v1.3.10', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
     const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + MAX_RENT, {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
     const statusCard = panelNode('div', null, {background: panelBackgrounds[tone], borderLeft: '3px solid ' + panelColors[tone],
       borderRadius: '8px', padding: '9px 11px', marginBottom: '10px'});

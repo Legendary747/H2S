@@ -1,17 +1,21 @@
 # H2S 五城市房源监控
 
-Tampermonkey 脚本 **v1.3.9**：在打开的 Holland2Stay 房源列表页运行。保留 **Available to book**，不选 City，多页时自动选择 **Price**，从第一页按主租金扫描，在首次出现超预算房源的当前页读完后停止翻页。只通知目标五城、主租金 ≤ €1500、可直接预订的房源。
+Tampermonkey 脚本 **v1.3.10**：在打开的 Holland2Stay 房源列表页运行。保留 **Available to book**，不选 City，多页时自动选择 **Price**，从第一页按主租金扫描，在首次出现超预算房源的当前页读完后停止翻页。只通知目标五城、主租金 ≤ €1000、可直接预订的房源。
 
 电脑需要联网、不休眠，并保持浏览器页面打开。GitHub 保存代码；推送更新不会自动替换已经安装的 Tampermonkey 脚本。
 
 ## 更新和立即检查
 
-1. 用 [`h2s-monitor.user.js`](h2s-monitor.user.js) 的全部内容覆盖 Tampermonkey 中原有脚本，保存，再刷新 H2S 页面。确认面板版本为 **1.3.9**。
+1. 用 [`h2s-monitor.user.js`](h2s-monitor.user.js) 的全部内容覆盖 Tampermonkey 中原有脚本，保存，再刷新 H2S 页面。确认面板版本为 **1.3.10**。
 2. 保持英文界面，选择 **Available to book**。City 可留空，或手动选择一个目标城市。
 3. **23:00–07:00 荷兰时间不自动开始扫描，也不自动点 Sort。** 夜间点击面板上的 **立即检查（夜间也可运行）**，或使用 Tampermonkey 同名菜单。
 4. 手动调整筛选后会先等待 30 秒。启动扫描后先等房源列表稳定；确认有多页才尝试排序。无需反复点击。
 
 原脚本名称、namespace、Telegram 存储键和历史格式保持不变。直接覆盖原脚本即可保留配置和已成功通知记录；无需清除历史或强制重发。
+
+## v1.3.10：正式预算为主租金 ≤ €1000
+
+用户确认此前 €1500 只用于测试，正式默认预算改为 €1000（含 €1000，不含 €1000.01）。没有符合预算的房源时，符合数量为 0 且不发房源消息是正常结果。Telegram 配置、历史和已验证的排序方式保持不变，无需清除历史。
 
 ## v1.3.9：彩色浮窗与通知说明
 
@@ -66,7 +70,7 @@ v1.3.5 在还没有识别到 Price 时共用这条提示。夜间尚未启动、
 | 项目 | 行为 |
 | --- | --- |
 | 城市 | The Hague / Den Haag、Rijswijk、Rotterdam、Leiden、Zoetermeer |
-| 预算 | 主租金 ≤ €1500，不含 servicekosten；€1500 包含，€1500.01 超出 |
+| 预算 | 主租金 ≤ €1000，不含 servicekosten；€1000 包含，€1000.01 超出 |
 | 状态 | 只通知 Book directly / Available to book，排除 Lottery |
 | Price | 按用户确认的站点规则视为从低到高；无需 Low to High 文字 |
 | Available start date | 日期升序，不能用来按租金停止翻页 |
@@ -134,7 +138,7 @@ Token 和 Chat ID 都保存在 Tampermonkey 的脚本存储中，代码不包含
 
 ```javascript
 const TARGET_CITIES = ['The Hague', 'Rijswijk', 'Rotterdam', 'Leiden', 'Zoetermeer'];
-const MAX_RENT = 1500;
+const MAX_RENT = 1000;
 const STORAGE_PREFIX = 'h2s_single_city_den_haag';
 const TIME_ZONE = 'Europe/Amsterdam';
 const START_HOUR = 7;
@@ -149,9 +153,9 @@ const MAX_PAGES = 50;
 
 ## 验证与开发
 
-v1.3.9：**67 项 Node/linkedom 离线回归测试通过，JavaScript 语法检查通过。** 在现有夜间手动扫描、静默基线和强制重发测试中补充通知说明断言；保留已验证的 Price 事件组合、预算停止、城市筛选、通知去重和失败续传测试。
+v1.3.10：**67 项 Node/linkedom 离线回归测试通过，JavaScript 语法检查通过。** 现有运行测试按正式预算更新：€1000 包含、€1000.01 超预算；上传的海牙单页快照中无 €1000 内房源时不发送通知。保留已验证的 Price 事件组合、预算停止、城市筛选、通知去重、静默基线和失败续传测试。
 
-测试采用已上传的精简 HTML 结构；鼠标/指针事件构造器、布局坐标、焦点、时间、分页、Web Locks 和 Telegram 均由测试模拟。模拟的事件要求用于覆盖观察到的差异，并非已取得官网处理函数的源码。本版没有发送真实 Telegram 消息，也没有完成真实官网端到端或原生浏览器视觉验收。用户已确认 v1.3.8 排序可用。仓库的 `browser-test-results.json` 是 **v1.3.5** 的历史 35 项 Chromium 结果，本轮没有重跑该 Python/Chromium 套件，不能当作 v1.3.9 的浏览器验收结果。
+测试采用已上传的精简 HTML 结构；鼠标/指针事件构造器、布局坐标、焦点、时间、分页、Web Locks 和 Telegram 均由测试模拟。模拟的事件要求用于覆盖观察到的差异，并非已取得官网处理函数的源码。本版没有发送真实 Telegram 消息，也没有完成真实官网端到端或原生浏览器视觉验收。用户已确认 v1.3.8 排序可用。仓库的 `browser-test-results.json` 是 **v1.3.5** 的历史 35 项 Chromium 结果，本轮没有重跑该 Python/Chromium 套件，不能当作 v1.3.10 的浏览器验收结果。
 
 普通安装不需要 Node.js。维护代码使用 Node.js 20+：
 

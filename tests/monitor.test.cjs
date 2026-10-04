@@ -552,7 +552,7 @@ test('sort selection uses the observed ProductSort control and verifies the asce
   assert.equal(app.messages.length,2);
   assert.match(app.panel,/价格排序：Price · 从低到高/);
 });
-test('single-page The Hague scans without Sort or ascending prices and remains deduplicated at night',async()=>{
+test('single-page The Hague scans without Sort at night and sends nothing when all listings exceed €1000',async()=>{
   const rows=core.parsePage(parseHTML(selectedCityPage).document).listings;
   for(const sortMode of ['unset','price','desc','missing']){
     const app=harness({pages:[rows],cityFilter:'The Hague',actualCityControls:true,sortMode,configured:true,startTime:'2026-10-03T22:00:00Z'});
@@ -560,11 +560,11 @@ test('single-page The Hague scans without Sort or ascending prices and remains d
     app.document.querySelector('.residence_pagination').remove();
     app.manualClick(app.document.querySelector('[aria-label="Current Filters"]'));
     await check(app);
-    assert.equal(app.messages.length,3,app.panel);assert.equal(app.sortClicks,0);
+    assert.equal(app.messages.length,0,app.panel);assert.equal(app.sortClicks,0);
     assert.deepEqual(app.visited,[1]);assert.equal(rowsOf(app.history).length,9);
-    assert.match(app.panel,/当前仅一页，无需排序/);assert.match(app.panel,/已读 9 套 · 符合 3 套/);
+    assert.match(app.panel,/当前仅一页，无需排序/);assert.match(app.panel,/已读 9 套 · 符合 0 套/);
     assert.equal(Object.values(app.history.scans)[0].cutoff,false);
-    await check(app);assert.equal(app.messages.length,3);
+    await check(app);assert.equal(app.messages.length,0);
   }
 });
 test('Price-only menu can be selected automatically and stops after the over-budget page',async()=>{
@@ -639,21 +639,21 @@ test('unknown sort and descending actual prices never initialize history or cont
   assert.deepEqual(unsorted.visited,[1]);
   assert.match(unsorted.panel,/等待价格升序生效/);
 });
-test('price cutoff stops requests after the first over-budget page, includes exactly €1500, and excludes lottery/other cities',async()=>{
-  const rows=priced([900,1000,1200,1500,1501,1800]);
+test('price cutoff stops requests after the first over-budget page, includes exactly €1000, and excludes lottery/other cities',async()=>{
+  const rows=priced([700,800,900,1000,1000.01,1800]);
   rows[0].city='Amsterdam';rows[0].title='Example, Amsterdam';
   rows[1].status='Available in lottery';
   const app=harness({pages:[rows.slice(0,2),rows.slice(2,4),rows.slice(4)],configured:true});await drain();
   assert.deepEqual(app.visited,[1,2,3]);
   assert.equal(app.messages.length,2);
-  assert.ok(app.messages.some(x=>x.text.includes('€1500.00')));
+  assert.ok(app.messages.some(x=>x.text.includes('€1000.00')));
   assert.ok(Object.values(app.history.scans)[0].cutoff);
   const early=harness({pages:[rows.slice(0,3),[rows[4]],[rows[5]]],configured:true});await drain();
   assert.deepEqual(early.visited,[1,2]);
   assert.equal(early.messages.length,1);
 });
 test('an all-over-budget first page performs no next-page request and produces no listing notifications',async()=>{
-  const app=harness({pages:priced([1501,2000]).map(x=>[x]),configured:true});await drain();
+  const app=harness({pages:priced([1000.01,2000]).map(x=>[x]),configured:true});await drain();
   assert.deepEqual(app.visited,[1]);assert.equal(app.messages.length,0);
   assert.match(app.panel,/超预算位置，停止翻页/);
 });
