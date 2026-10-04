@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.7
+// @version      1.3.8
 // @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -268,6 +268,33 @@
       return isPriceChoice(text(node)) || /^available start date$/i.test(text(node));
     });
   }
+  function pressSortOption(button) {
+    // This exact combination worked on the user's live page when button.click()
+    // did not: focus, the inner label as target, coordinates, and press/release
+    // events. We have not isolated which difference the site requires.
+    const target = button.querySelector('span') || button;
+    const rect = target.getBoundingClientRect();
+    const view = button.ownerDocument.defaultView;
+    const init = {
+      bubbles: true, cancelable: true, composed: true,
+      view, button: 0, detail: 1,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      pointerId: 1, pointerType: 'mouse', isPrimary: true
+    };
+    button.focus({preventScroll: true});
+    for (const [type, EventClass, buttons] of [
+      ['pointerdown', view.PointerEvent, 1],
+      ['mousedown', view.MouseEvent, 1],
+      ['pointerup', view.PointerEvent, 0],
+      ['mouseup', view.MouseEvent, 0],
+      ['click', view.PointerEvent, 0]
+    ]) {
+      target.dispatchEvent(new EventClass(type, {...init, buttons}));
+    }
+    // Dispatching events is not confirmation; ensurePriceSort reads the site's
+    // selected option or title on the next iteration before allowing a scan.
+  }
   function challenge(doc) {
     // A normal embedded Turnstile widget or the word "Cloudflare" is NOT a challenge page.
     if (doc.querySelector('#challenge-running,#challenge-stage,#challenge-form,#cf-error-details')) return true;
@@ -432,7 +459,7 @@
     const others = Object.values(history.cities).flatMap(state => Object.values(state.items)).filter(item => item.pending && item.eligible && !item.missing).length - pending;
     const sorting = priceSortState(document);
     const mode = sameScope ? stats.mode : previous?.mode;
-    panelText.textContent = ['H2S v1.3.7 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
+    panelText.textContent = ['H2S v1.3.8 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
       '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
       '可订状态：' + (filters.availability || '未筛选（仅通知可直接预订）'),
       '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
@@ -498,7 +525,7 @@
         if (option && attempts < SORT_MAX_ATTEMPTS && Date.now() - lastClickAt >= SORT_RETRY_MS) {
           // Invalidate a previous Date selection before React handles the click.
           forgetPriceSort(document);
-          option.click();
+          pressSortOption(option);
           attempts++;
           lastClickAt = lastOpenAt = Date.now();
           reason = '已点击 Price（第 ' + attempts + '/' + SORT_MAX_ATTEMPTS + ' 次），等待官网确认选中';

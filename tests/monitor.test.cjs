@@ -326,9 +326,16 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
   sortMode = 'asc', sortOptionLabel = 'Price: Low to High', sortOptionTag = 'button', canSort = true, configured = false, blocked = false, brokenPage = 0,
   actualSortControls = false, sortMenuOpen = false, availability = null, collapsedAvailability = false,
   sortDelay = 0, ignorePrice = false, closeSortMenu = false, ignorePriceClicks = 0, dateTrigger = false, sortBusyMs = 0,
+  sortInteraction = 'click', updateSortTitle = false,
   startTime = '2026-10-03T10:00:00Z', initialState, onRequest, onPage} = {}) {
   pages ||= [[sample()], [sample({rent:1000,url:sample().url.replace('example','second')})]];
   const {document,window} = parseHTML(fixture);
+  // linkedom has no native mouse/pointer constructors or layout. These are
+  // explicit test doubles, not a claim of browser-level input validation.
+  window.MouseEvent = class extends window.Event {
+    constructor(type, init = {}) {super(type, init);Object.assign(this, init);}
+  };
+  window.PointerEvent = class extends window.MouseEvent {};
   const template = document.querySelectorAll('.residence_block')[6].cloneNode(true);
   const list = document.querySelector('.residence_MainSection');
   const pager = document.querySelector('.residence_pagination');
@@ -393,19 +400,42 @@ function harness({pages, cityFilter = null, collapsedCity = false, extraFilter =
       sortClicks++;
       if(menu.parentElement) menu.remove();else sorting.append(menu);
     });
-    options.forEach(button=>button.addEventListener('click',()=>{
-      sortOptionClicks++;
-      if (ignorePrice || sortOptionClicks <= ignorePriceClicks) return;
-      const apply = () => {
-        options.forEach(option=>option.setAttribute('data-cy',option===button?'SortItem-activeButton':'SortItem-button'));
-        if (closeSortMenu) menu.remove();
-        // Keep the original header to test the actual active-item marker.
-        sorting.setAttribute('aria-busy','false');
-        showPage(1);
-      };
-      if (sortBusyMs) {sorting.setAttribute('aria-busy','true');pendingSort={at:clock+sortBusyMs,apply};}
-      else apply();
-    }));
+    options.forEach(button=>{
+      const label = button.querySelector('span');
+      const pressed = new Set();
+      let focused = false;
+      label.getBoundingClientRect = () => ({left:100,top:200,width:80,height:24});
+      button.focus = () => {focused = true;};
+      // Two possible site contracts cover the observed difference between a
+      // button.click() and the user's working label press sequence. Neither is
+      // asserted to be the website's actual internal implementation.
+      for (const type of ['pointerdown','mousedown','pointerup','mouseup']) {
+        button.addEventListener(type,event=>{
+          const pointer = type.startsWith('pointer');
+          if (event.target === label && event.clientX === 140 && event.clientY === 212 &&
+              event.button === 0 && event.buttons === (type.endsWith('down') ? 1 : 0) &&
+              (!pointer || (event.pointerType === 'mouse' && event.isPrimary && event.pointerId === 1))) pressed.add(type);
+        });
+      }
+      button.addEventListener('click',event=>{
+        sortOptionClicks++;
+        const accepted = sortInteraction === 'click' || (event.target === label &&
+          (sortInteraction === 'span' || (focused && pressed.size === 4 && event.detail === 1 &&
+           event.view === window && event instanceof window.PointerEvent)));
+        pressed.clear();
+        if (!accepted || ignorePrice || sortOptionClicks <= ignorePriceClicks) return;
+        const apply = () => {
+          options.forEach(option=>option.setAttribute('data-cy',option===button?'SortItem-activeButton':'SortItem-button'));
+          if (updateSortTitle) sorting.querySelector('[data-cy="ProductSort-sortButton"]').textContent=button.textContent.trim();
+          if (closeSortMenu) menu.remove();
+          // Older fixtures keep the header unchanged to test the active marker.
+          sorting.setAttribute('aria-busy','false');
+          showPage(1);
+        };
+        if (sortBusyMs) {sorting.setAttribute('aria-busy','true');pendingSort={at:clock+sortBusyMs,apply};}
+        else apply();
+      });
+    });
   }else{
     sorting.querySelector('button').addEventListener('click',() => {
       sortClicks++;
@@ -546,11 +576,11 @@ test('Price-only menu can be selected automatically and stops after the over-bud
   assert.match(app.panel,/Price · 从低到高/);assert.doesNotMatch(app.panel,/升序方向未确认/);
   assert.equal(Object.values(app.history.scans)[0].cutoff,true);
 });
-test('actual nested Sort menu clicks the inner Price button, then scans the selected city at night',async()=>{
+test('actual nested Sort menu activates the inner Price label, then scans the selected city at night',async()=>{
   for(const sortMenuOpen of [false,true]){
     const app=harness({cityFilter:'The Hague',actualSortControls:true,sortMenuOpen,configured:true,startTime:'2026-10-03T22:00:00Z'});
     await drain();await check(app);
-    assert.equal(app.sortOptionClicks,1,'Price must be clicked on the button, not its parent li');
+    assert.equal(app.sortOptionClicks,1,'Price activation must reach its button handler, not just the parent li');
     assert.equal(app.sortClicks,sortMenuOpen?0:1,'An already open menu must not be closed');
     assert.equal(app.document.querySelector('[data-cy="SortItem-activeButton"]').textContent.trim(),'Price');
     assert.deepEqual(app.visited,[1,1,2]);assert.equal(app.messages.length,2);
@@ -729,6 +759,43 @@ test('Date-selected menu recovers if the first Price click has no effect',async(
     assert.match(app.panel,/Price · 从低到高/);
     await check(app);assert.equal(app.sortOptionClicks,2);assert.equal(app.messages.length,2);
   }
+});
+test('Date-selected menu that ignores button.click accepts label presses and confirms its closed-menu title',async()=>{
+  const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',sortMenuOpen:true,
+    sortInteraction:'press',updateSortTitle:true,closeSortMenu:true,configured:true,startTime:'2026-10-03T22:00:00Z'});
+  await drain();
+  const price=[...app.document.querySelectorAll('button.sorting_btn')].find(button=>button.textContent.trim()==='Price');
+  price.click();
+  assert.equal(core.priceSortState(app.document).choice,'date','a bare click must reproduce the observed failure');
+  assert.equal(app.history,undefined);
+  await check(app);
+  assert.equal(core.priceSortState(app.document).ok,true,app.panel);
+  assert.equal(app.document.querySelector('[data-cy="SortItem-activeButton"]'),null,'the successful selection closes the menu');
+  assert.equal(app.sortClicks,0,'the Price title confirms selection without reopening');
+  assert.equal(app.sortOptionClicks,2,'one failed bare click followed by one successful press sequence');
+  assert.equal(app.messages.length,2);assert.match(app.panel,/本轮已完成/);
+  await check(app);assert.equal(app.sortOptionClicks,2);assert.equal(app.messages.length,2,'successful alerts stay deduplicated');
+});
+test('fresh Sort title opens its menu, uses label presses, waits for selection and stops above budget',async()=>{
+  const app=harness({actualSortControls:true,sortMode:'unset',sortInteraction:'press',updateSortTitle:true,
+    closeSortMenu:true,sortBusyMs:1500,configured:true,pages:priced([900,1000,1600,1700]).map(row=>[row])});
+  await drain();
+  assert.equal(core.priceSortState(app.document).ok,true,app.panel);
+  assert.equal(app.sortClicks,1);assert.equal(app.sortOptionClicks,1);
+  assert.deepEqual(app.visited,[1,1,2,3]);assert.equal(app.messages.length,2);
+  assert.equal(Object.values(app.history.scans)[0].cutoff,true);
+});
+test('sort handlers that depend only on the inner span also receive the Price click',async()=>{
+  const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',sortMenuOpen:true,
+    sortInteraction:'span',updateSortTitle:true,closeSortMenu:true,configured:true});
+  await drain();assert.equal(app.sortOptionClicks,1);assert.equal(app.messages.length,2,app.panel);
+  assert.equal(core.priceSortState(app.document).ok,true);
+});
+test('a dispatched label press sequence still needs website confirmation before global scanning',async()=>{
+  const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',sortInteraction:'press',
+    updateSortTitle:true,ignorePrice:true,configured:true});
+  await drain();assert.equal(app.sortOptionClicks,3);assert.equal(app.history,undefined);
+  assert.equal(app.messages.length,0);assert.deepEqual(app.visited,[1]);assert.match(app.panel,/未能选中 Price/);
 });
 test('a pending sort request is allowed to finish without retry clicks while aria-busy',async()=>{
   const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',sortBusyMs:10000,configured:true});
