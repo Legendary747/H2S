@@ -1,0 +1,149 @@
+{
+  "source": "h2s-monitor.user.js",
+  "tests": 35,
+  "passed": 35,
+  "failed": 0,
+  "results": [
+    {
+      "name": "bare Price means ascending; date is not a price sort",
+      "status": "PASS"
+    },
+    {
+      "name": "explicit descending is never a budget sort",
+      "status": "PASS"
+    },
+    {
+      "name": "localized ascending and price checkmarks remain supported",
+      "status": "PASS"
+    },
+    {
+      "name": "active Price survives menu unmount",
+      "status": "PASS"
+    },
+    {
+      "name": "active Date overrides stale Price trigger and cache",
+      "status": "PASS"
+    },
+    {
+      "name": "cache invalidates on filter or root replacement",
+      "status": "PASS"
+    },
+    {
+      "name": "busy Price is selected but not yet ready",
+      "status": "PASS"
+    },
+    {
+      "name": "availability is independent from city",
+      "status": "PASS"
+    },
+    {
+      "name": "euro conventions and service-cost rejection",
+      "status": "PASS"
+    },
+    {
+      "name": "Amsterdam clock boundaries and winter time",
+      "status": "PASS"
+    },
+    {
+      "name": "legacy history import retains success and pending",
+      "status": "PASS"
+    },
+    {
+      "name": "parse actual sanitized snapshot snapshot-global.html",
+      "status": "PASS"
+    },
+    {
+      "name": "parse actual sanitized snapshot snapshot-the-hague.html",
+      "status": "PASS"
+    },
+    {
+      "name": "full scan: Price closes menu, asynchronous load, five-city cutoff",
+      "status": "PASS"
+    },
+    {
+      "name": "preselected Price in closed menu: no redundant Price click",
+      "status": "PASS"
+    },
+    {
+      "name": "already-open Date menu: inner Price button works",
+      "status": "PASS"
+    },
+    {
+      "name": "menu stays open after selecting Price",
+      "status": "PASS"
+    },
+    {
+      "name": "starts on page 3: returns to page 1 and stops at page 2",
+      "status": "PASS"
+    },
+    {
+      "name": "sort resets to page 1 during asynchronous update",
+      "status": "PASS"
+    },
+    {
+      "name": "second scan preserves credentials and never repeats successes",
+      "status": "PASS"
+    },
+    {
+      "name": "manual Date selection invalidates cached Price even if menu closes",
+      "status": "PASS"
+    },
+    {
+      "name": "exactly €1500 included; all-affordable results reach final page",
+      "status": "PASS"
+    },
+    {
+      "name": "single-city, single-page, no Sort, excludes Lottery",
+      "status": "PASS"
+    },
+    {
+      "name": "actual The Hague snapshot: entire userscript reads 9 and queues 3 direct rentals",
+      "status": "PASS"
+    },
+    {
+      "name": "upgrade with cumulative 9: preserves old success, sends only 3 new matches",
+      "status": "PASS"
+    },
+    {
+      "name": "within-page descending prices: no complete history",
+      "status": "PASS"
+    },
+    {
+      "name": "cross-page inversion: no complete history",
+      "status": "PASS"
+    },
+    {
+      "name": "total changes during pagination: no complete history",
+      "status": "PASS"
+    },
+    {
+      "name": "duplicate listing URL across pages: rejected",
+      "status": "PASS"
+    },
+    {
+      "name": "pagination stays busy: timeout without losing history",
+      "status": "PASS"
+    },
+    {
+      "name": "filter changes mid-scan: cancels old scope",
+      "status": "PASS"
+    },
+    {
+      "name": "Price click did not apply: never assumes click succeeded",
+      "status": "PASS"
+    },
+    {
+      "name": "challenge during pagination pauses without completing",
+      "status": "PASS"
+    },
+    {
+      "name": "Telegram failure keeps queue; retry does not resend successful item",
+      "status": "PASS"
+    },
+    {
+      "name": "night automatic pause but menu scan can send notifications",
+      "status": "PASS"
+    }
+  ],
+  "environment": "Chromium local fixture; real DOM; accelerated clock; mocked H2S interactions, navigation, Web Locks and Telegram; no live website E2E"
+}

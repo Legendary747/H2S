@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.4
-// @description  Scan H2S selected-city listings, use verified ascending rent for budget cutoff, and notify for five allowed cities.
+// @version      1.3.5
+// @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
 // @grant        GM_getValue
@@ -190,28 +190,75 @@
       + (otherChips.length ? '；未支持的筛选：' + otherChips.map(chip => chip.name).join(', ') : '');
     return {ok: !reason, city, cities: names, wanted, allCities, availability, reason};
   }
-  function isAscendingPrice(value) {
-    const label = clean(value);
-    return /\b(?:price|rent|prijs)\b/i.test(label) &&
-      /\blow(?:est)?\s*(?:to|[-–→])\s*high(?:est)?\b|\basc(?:ending)?\b|laag.*hoog|oplopend|↑/i.test(label) &&
-      !/\bhigh(?:est)?\s*(?:to|[-–→])\s*low(?:est)?\b|\bdesc(?:ending)?\b/i.test(label);
-  }
-  function isPriceChoice(value) {
+  // Site convention explicitly chosen by the user: both bare sort labels are
+  // ascending. Only Price can justify a rent-budget cutoff; date order cannot.
+  const sortSelections = new WeakMap();
+  function sortChoice(value) {
     const label = clean(String(value || '').replace(/[✓✔]/g, ''));
-    return /^(?:price|rent|prijs)$/i.test(label) || isAscendingPrice(label);
+    const descending = /\bhigh(?:est)?\s*(?:to|[-–→])\s*low(?:est)?\b|\bdesc(?:ending)?\b|hoog.*laag|aflopend|↓/i.test(label);
+    const price = /^(?:price|rent|prijs)$/i.test(label) ||
+      (/\b(?:price|rent|prijs)\b/i.test(label) &&
+       /\blow(?:est)?\s*(?:to|[-–→])\s*high(?:est)?\b|\basc(?:ending)?\b|laag.*hoog|oplopend|↑/i.test(label));
+    if (descending) return {key: /\b(?:price|rent|prijs)\b/i.test(label) ? 'price' : 'other', ascending: false, label};
+    if (price) return {key: 'price', ascending: true, label};
+    if (/^available start date$/i.test(label)) return {key: 'date', ascending: true, label};
+    return {key: 'other', ascending: false, label};
   }
+  function isAscendingPrice(value) {
+    const choice = sortChoice(value);
+    return choice.key === 'price' && choice.ascending;
+  }
+  const isPriceChoice = isAscendingPrice;
+  function sortContext(doc) {
+    const filters = filterState(doc);
+    return filters.ok ? JSON.stringify([filters.allCities ? '*' : cityKey(filters.city), filters.availability || '']) : null;
+  }
+  function forgetPriceSort(doc) { sortSelections.delete(doc); }
   function priceSortState(doc) {
     const root = doc.querySelector('[data-cy="ProductSort-root"]');
     const button = root?.querySelector('[data-cy="ProductSort-sortButton"]');
     const chosen = root?.querySelector('[data-cy="SortItem-activeButton"]') ||
       root?.querySelector('[aria-selected="true"],[aria-checked="true"],input:checked');
-    // H2S can keep the trigger at "Sort ..." while the menu marks the actual
-    // selection with SortItem-activeButton. That selection overrides the trigger.
-    const labels = chosen ? [text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label')] : [text(button)];
-    const ready = root?.getAttribute('aria-busy') !== 'true';
-    // The actual menu says only "Price". That is a selected price sort, but does
-    // not prove global ascending main-rent order (availability may be grouped).
-    return {ok: ready && labels.some(isAscendingPrice), selected: ready && labels.some(isPriceChoice), button, root};
+    const context = sortContext(doc);
+    const cached = sortSelections.get(doc);
+    if (!root || context === null || (cached && (cached.root !== root || cached.context !== context))) forgetPriceSort(doc);
+    const busy = root?.getAttribute('aria-busy') === 'true';
+    const label = chosen ? text(chosen.closest('label')) || text(chosen) || chosen.getAttribute('aria-label') : text(button);
+    const choice = sortChoice(label);
+    let selection = null;
+    // Actual active options always override a stale trigger or cached selection.
+    // A click alone is never proof: the menu is reopened to read its active item.
+    if (chosen || choice.key !== 'other' || (label && !/^sort\s*(?:\.{3}|…)?$/i.test(label))) {
+      selection = {...choice, root, context, source: chosen ? 'active-option' : 'trigger'};
+      if (!busy && root && context !== null) sortSelections.set(doc, selection);
+    } else if (root && context !== null) {
+      const remembered = sortSelections.get(doc);
+      if (remembered) selection = {...remembered, source: 'verified-menu-cache'};
+    }
+    const selected = selection?.key === 'price' && selection.ascending;
+    return {ok: Boolean(root && !busy && selected), selected: Boolean(selected), busy,
+      choice: selection?.key || '', ascending: Boolean(selection?.ascending),
+      source: selection?.source || '', button, root};
+  }
+  function sortOptions(doc, sorting = priceSortState(doc)) {
+    const candidates = [...(sorting.root?.querySelectorAll('button[data-cy="SortItem-button"],button[data-cy="SortItem-activeButton"]') || []),
+      ...(sorting.root?.querySelectorAll('button,a,[role="option"],[role="menuitem"],label') || []),
+      ...doc.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]'),
+      ...[...(sorting.root?.querySelectorAll('li') || [])].filter(node => !node.querySelector('button,a,[role="option"],[role="menuitem"],label'))];
+    return [...new Set(candidates)].filter(node => {
+      if (node === sorting.button || sorting.button?.contains(node) || node.closest('[hidden],[aria-hidden="true"]') ||
+          node.hasAttribute('disabled') || node.getAttribute('aria-disabled') === 'true') return false;
+      // Ignore menus kept in the DOM with display:none; jsdom/linkedom need no layout.
+      const style = doc.defaultView?.getComputedStyle;
+      for (let el = node; el && el !== doc.body; el = el.parentElement) {
+        if (el.style?.display === 'none' || el.style?.visibility === 'hidden') return false;
+        if (style) {
+          const css = style.call(doc.defaultView, el);
+          if (css.display === 'none' || css.visibility === 'hidden') return false;
+        }
+      }
+      return isPriceChoice(text(node)) || /^available start date$/i.test(text(node));
+    });
   }
   function challenge(doc) {
     // A normal embedded Turnstile widget or the word "Cloudflare" is NOT a challenge page.
@@ -233,7 +280,7 @@
   function validateBudgetSweep(listings, total, maxRent, city, ended) {
     if (new Set(listings.map(item => item.url)).size !== listings.length || listings.length > total) throw Error('分页重复或数量不一致；本轮不更新历史');
     if (city && listings.some(item => !matchesCity(item.city, city))) throw Error('房源城市与所选城市不一致；本轮不更新历史');
-    if (listings.some((item, index) => index && item.rent < listings[index - 1].rent)) throw Error('价格没有按升序排列；请确认 Price: low to high');
+    if (listings.some((item, index) => index && item.rent < listings[index - 1].rent)) throw Error('Price 列表实际不是价格升序；本轮不更新历史');
     const cutoff = listings.some(item => item.rent > maxRent);
     if (!cutoff && (!ended || listings.length !== total)) throw Error('预算内分页尚未完成；本轮不更新历史');
     return {cutoff};
@@ -305,7 +352,7 @@
   // The userscript is also directly importable by the offline regression tests.
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {cityKey, cityKeys, matchesCity, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
-      filterState, isAscendingPrice, isPriceChoice, priceSortState, challenge, withinHours, validateSweep, validateBudgetSweep,
+      filterState, sortChoice, isAscendingPrice, isPriceChoice, priceSortState, forgetPriceSort, sortOptions, challenge, withinHours, validateSweep, validateBudgetSweep,
       cityScope, historyFrom, freshState, reconcile, deliverPending};
     return;
   }
@@ -331,7 +378,7 @@
   const stats = {message: '正在启动', phase: '未开始', mode: '', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
   const panel = document.createElement('aside');
   panel.id = 'h2s-monitor-panel';
-  Object.assign(panel.style, {position: 'fixed', right: '16px', bottom: '84px', zIndex: '2147483646', padding: '14px 16px',
+  Object.assign(panel.style, {position: 'fixed', right: '16px', bottom: '84px', zIndex: 2147483646, padding: '14px 16px',
     width: '300px', maxWidth: '80vw', background: '#102c32', color: '#efffff', font: '13px/1.6 system-ui,sans-serif',
     border: '1px solid #75c8d2', borderRadius: '12px', boxShadow: '0 6px 28px #0005', whiteSpace: 'pre-wrap'});
   document.body.append(panel);
@@ -351,12 +398,12 @@
     const others = Object.values(history.cities).flatMap(state => Object.values(state.items)).filter(item => item.pending && item.eligible && !item.missing).length - pending;
     const sorting = priceSortState(document);
     const mode = sameScope ? stats.mode : previous?.mode;
-    panel.textContent = ['H2S · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
+    panel.textContent = ['H2S v1.3.5 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
       '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
       '可订状态：' + (filters.availability || '未筛选（仅通知可直接预订）'),
       '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
-      '允许扫描：' + (filters.ok ? '是' : '否；' + filters.reason),
-      '价格排序：' + (mode === 'single' ? '当前仅一页，无需排序' : sorting.ok ? '从低到高' : sorting.selected ? '已选择 Price，升序方向未确认' : '尚未确认升序'),
+      '筛选条件：' + (filters.ok ? '通过' : '未通过；' + filters.reason),
+      '价格排序：' + (mode === 'single' ? '当前仅一页，无需排序' : sorting.busy ? '正在加载' : sorting.ok ? 'Price · 从低到高' : sorting.choice === 'date' ? '当前为日期升序，将切换到 Price' : '等待选择 Price'),
       ...(mode === 'city' ? ['扫描方式：读完当前城市全部页，再按预算筛选'] : []),
       '扫描状态：' + (isLeader ? stats.phase : '待机，另一个标签页正在监控'), stats.message,
       '已读 ' + (sameScope ? stats.scanned : previous?.inspected || 0) + ' 套 · 符合 ' + (sameScope ? stats.matched : previous?.matched || 0) + ' 套 · 第 ' + (sameScope ? stats.pages : previous?.pages || 0) + ' 页',
@@ -388,33 +435,36 @@
   }
   function assertAllowed(scope, manual, requireAscending = false) {
     assertScope(scope, manual);
-    if (requireAscending && !priceSortState(document).ok) throw Error('升序排序发生变化；本轮预算截断扫描已取消');
+    const sorting = priceSortState(document);
+    // Busy is transient during React pagination; stablePage waits for it to clear.
+    if (requireAscending && !sorting.ok && !sorting.busy) throw Error('Price 排序发生变化；本轮预算截断扫描已取消');
   }
   async function ensurePriceSort(scope, manual) {
     const initial = priceSortState(document);
-    if (initial.selected || !initial.button) return initial;
-    setStatus('准备排序', '正在选择官网 Price 价格排序');
-    const findOption = sorting => {
-      // The supplied menu is li > button > span. Clicking the li does not click
-      // its child button or invoke the button's handler, so prefer actual controls.
-      const candidates = [...(sorting.root?.querySelectorAll('button[data-cy="SortItem-button"],button[data-cy="SortItem-activeButton"]') || []),
-        ...(sorting.root?.querySelectorAll('button,a,[role="option"],[role="menuitem"],label') || []),
-        ...document.querySelectorAll('[role="listbox"] [role="option"],[role="menu"] [role="menuitem"]'),
-        ...[...(sorting.root?.querySelectorAll('li') || [])].filter(node => !node.querySelector('button,a,[role="option"],[role="menuitem"],label'))]
-        .filter(node => node !== sorting.button && !sorting.button?.contains(node) &&
-          !node.closest('[hidden],[aria-hidden="true"]') && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true');
-      return candidates.find(node => isAscendingPrice(text(node))) || candidates.find(node => isPriceChoice(text(node)));
-    };
-    if (!findOption(initial)) initial.button.click();
+    if (initial.ok || !initial.button) return initial;
+    setStatus('准备排序', '正在选择 Price（从低到高）');
     const start = Date.now();
-    let chosen = false;
+    let clickedPrice = false;
+    let lastOpenAt = -Infinity;
     while (Date.now() - start < MAX_SETTLE_MS) {
       assertScope(scope, manual);
       const sorting = priceSortState(document);
-      if (sorting.selected) return sorting;
-      if (!chosen) {
-        const option = findOption(sorting);
-        if (option) { option.click(); chosen = true; }
+      if (sorting.ok) return sorting;
+      if (!sorting.busy) {
+        const options = sortOptions(document, sorting);
+        const option = options.find(node => isPriceChoice(text(node)));
+        if (option && !clickedPrice) {
+          // Invalidate a previous Date selection before React handles the click.
+          forgetPriceSort(document);
+          option.click();
+          clickedPrice = true;
+          lastOpenAt = Date.now();
+        } else if (!options.length && sorting.button && Date.now() - lastOpenAt >= 1500) {
+          // Selecting Price may immediately unmount the menu while the trigger
+          // still says Sort ... . Reopen it and read SortItem-activeButton.
+          sorting.button.click();
+          lastOpenAt = Date.now();
+        }
       }
       await sleep(500);
     }
@@ -563,11 +613,10 @@
       if (!singlePage(result)) {
         const sorting = await ensurePriceSort(scope, manual);
         if (!sorting.ok && filters.allCities) {
-          throw Error((sorting.selected ? '官网只显示 Price，无法确认整份列表按主租金升序' : '未能确认升序排序') +
-            '；请手动选择一个目标城市后立即检查');
+          throw Error('未能选中 Price；请展开 Sort 检查价格按钮后重试（无需选择城市）');
         }
         mode = sorting.ok ? 'budget' : 'city';
-        setStatus('已开始，等待列表稳定', mode === 'budget' ? '已确认升序，遇到主租金 > €' + MAX_RENT + ' 后停止翻页'
+        setStatus('已开始，等待列表稳定', mode === 'budget' ? '已选择 Price 升序，遇到主租金 > €' + MAX_RENT + ' 后停止翻页'
           : '未确认升序，将读取 ' + filters.city + ' 的全部页，再按预算筛选');
         result = await stablePage(scope, manual, undefined, null, mode === 'budget');
         if (singlePage(result)) mode = 'single';
@@ -744,6 +793,12 @@
     }
   });
   observer.observe(document.body, {childList: true, subtree: true, characterData: true});
+  document.addEventListener('click', event => {
+    const option = event.target.closest?.('button[data-cy="SortItem-button"],button[data-cy="SortItem-activeButton"],[role="option"],[role="menuitem"]');
+    if (option && (option.closest('[data-cy="ProductSort-root"]') || option.closest('[role="listbox"],[role="menu"]'))) {
+      forgetPriceSort(document);
+    }
+  }, true);
   document.addEventListener('change', event => {
     if (event.target.closest?.('#filter_accordion,[aria-label^="Filter products by "]')) {
       dirty = true; nextRefresh = 0; retryAt = Date.now() + 2000;
