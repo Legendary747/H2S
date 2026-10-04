@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.5
+// @version      1.3.6
 // @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -375,13 +375,22 @@
   let retryNoticeAt = 0;
   let daytime = withinHours();
   let maintenanceUntil = 0;
-  const stats = {message: '正在启动', phase: '未开始', mode: '', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
+  const stats = {message: '正在启动', phase: '未开始', sortStep: '', mode: '', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
   const panel = document.createElement('aside');
   panel.id = 'h2s-monitor-panel';
   Object.assign(panel.style, {position: 'fixed', right: '16px', bottom: '84px', zIndex: 2147483646, padding: '14px 16px',
     width: '300px', maxWidth: '80vw', background: '#102c32', color: '#efffff', font: '13px/1.6 system-ui,sans-serif',
     border: '1px solid #75c8d2', borderRadius: '12px', boxShadow: '0 6px 28px #0005', whiteSpace: 'pre-wrap'});
   document.body.append(panel);
+  const panelText = document.createElement('div');
+  const checkButton = document.createElement('button');
+  checkButton.id = 'h2s-monitor-check';
+  checkButton.type = 'button';
+  checkButton.textContent = '立即检查（夜间也可运行）';
+  Object.assign(checkButton.style, {display: 'block', marginTop: '10px', padding: '6px 10px',
+    border: '1px solid #75c8d2', borderRadius: '6px', background: '#17434b', color: '#efffff', cursor: 'pointer'});
+  checkButton.addEventListener('click', safe(async () => { requireIdle(); await runScan(true); }));
+  panel.append(panelText, checkButton);
   function configured() { return Boolean(get('token', '') && get('chatId', '')); }
   const readHistory = () => historyFrom(get('state', null));
   const targetsFor = filters => filters.allCities ? TARGET_CITIES : filters.city ? [filters.city] : [];
@@ -389,6 +398,23 @@
     ...(filters.availability ? ['availability:' + filters.availability] : [])]);
   const queuedItems = (history, filters) => Object.values(history.cities).flatMap(state => Object.values(state.items))
     .filter(item => item.pending && item.eligible && !item.missing && item.rent <= MAX_RENT && matchesCity(item.city, targetsFor(filters)));
+  function sortingStatus(sorting, mode, filters) {
+    if (mode === 'single') return '当前仅一页，无需排序';
+    if (sorting.ok) return 'Price · 从低到高';
+    if (!isLeader) return '尚未操作：等待此标签页取得监控锁';
+    if (get('paused', false)) return '尚未操作：监控已手动暂停';
+    if (challenge(document)) return '尚未操作：等待手动完成网页验证';
+    if (!filters.ok) return '尚未操作：筛选条件未通过';
+    if (!scanRunning && !withinHours()) return '夜间不自动选择；可点下方“立即检查”';
+    if (Date.now() < maintenanceUntil) return '尚未操作：等待手动操作稳定';
+    if (sorting.busy) return '正在加载：等待官网完成排序或翻页';
+    if (stats.sortStep && stats.scope === scopeFor(filters)) {
+      return stats.sortStep === 'Price · 从低到高' ? 'Price 状态已变化，等待重新确认' : stats.sortStep;
+    }
+    if (scanRunning) return '尚未操作：先等待房源列表稳定';
+    if (stats.phase === '扫描未完成') return '尚未操作：本轮在排序前停止，见下方原因';
+    return '尚未开始；扫描启动后自动选择 Price';
+  }
   function render() {
     const filters = filterState(document);
     const history = readHistory();
@@ -398,12 +424,12 @@
     const others = Object.values(history.cities).flatMap(state => Object.values(state.items)).filter(item => item.pending && item.eligible && !item.missing).length - pending;
     const sorting = priceSortState(document);
     const mode = sameScope ? stats.mode : previous?.mode;
-    panel.textContent = ['H2S v1.3.5 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
+    panelText.textContent = ['H2S v1.3.6 · 预算内扫描 · 主租金 ≤ €' + MAX_RENT,
       '当前城市：' + (filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
       '可订状态：' + (filters.availability || '未筛选（仅通知可直接预订）'),
       '目标城市：' + (filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认'),
       '筛选条件：' + (filters.ok ? '通过' : '未通过；' + filters.reason),
-      '价格排序：' + (mode === 'single' ? '当前仅一页，无需排序' : sorting.busy ? '正在加载' : sorting.ok ? 'Price · 从低到高' : sorting.choice === 'date' ? '当前为日期升序，将切换到 Price' : '等待选择 Price'),
+      '价格排序：' + sortingStatus(sorting, mode, filters),
       ...(mode === 'city' ? ['扫描方式：读完当前城市全部页，再按预算筛选'] : []),
       '扫描状态：' + (isLeader ? stats.phase : '待机，另一个标签页正在监控'), stats.message,
       '已读 ' + (sameScope ? stats.scanned : previous?.inspected || 0) + ' 套 · 符合 ' + (sameScope ? stats.matched : previous?.matched || 0) + ' 套 · 第 ' + (sameScope ? stats.pages : previous?.pages || 0) + ' 页',
@@ -414,6 +440,8 @@
       '上次完成预算内扫描 ' + formatTime(previous?.completedAt),
       '下次刷新 ' + formatTime(filters.ok && lastScope === scopeFor(filters) ? nextRefresh : 0),
       '自动运行 ' + String(START_HOUR).padStart(2, '0') + ':00–' + String(END_HOUR).padStart(2, '0') + ':00 荷兰时间'].join('\n');
+    checkButton.disabled = !isLeader || scanRunning || deliveryRunning || get('paused', false) || !filters.ok || challenge(document);
+    checkButton.style.opacity = checkButton.disabled ? '0.55' : '1';
   }
   function setMessage(message) { stats.message = message; render(); }
   function setStatus(phase, message) { stats.phase = phase; setMessage(message); }
@@ -441,16 +469,20 @@
   }
   async function ensurePriceSort(scope, manual) {
     const initial = priceSortState(document);
-    if (initial.ok || !initial.button) return initial;
+    if (initial.ok) return initial;
+    stats.sortStep = '正在准备 Price 排序';
     setStatus('准备排序', '正在选择 Price（从低到高）');
     const start = Date.now();
     let clickedPrice = false;
     let lastOpenAt = -Infinity;
+    let reason = '排序控件尚未加载';
     while (Date.now() - start < MAX_SETTLE_MS) {
       assertScope(scope, manual);
       const sorting = priceSortState(document);
-      if (sorting.ok) return sorting;
-      if (!sorting.busy) {
+      if (sorting.ok) { stats.sortStep = 'Price · 从低到高'; return sorting; }
+      if (sorting.busy) {
+        reason = '等待官网排序加载结束';
+      } else {
         const options = sortOptions(document, sorting);
         const option = options.find(node => isPriceChoice(text(node)));
         if (option && !clickedPrice) {
@@ -459,16 +491,27 @@
           option.click();
           clickedPrice = true;
           lastOpenAt = Date.now();
-        } else if (!options.length && sorting.button && Date.now() - lastOpenAt >= 1500) {
-          // Selecting Price may immediately unmount the menu while the trigger
-          // still says Sort ... . Reopen it and read SortItem-activeButton.
-          sorting.button.click();
-          lastOpenAt = Date.now();
+          reason = '已点击 Price，等待官网确认选中';
+        } else if (!options.length) {
+          reason = !sorting.button ? '未找到 Sort 按钮，等待控件加载'
+            : clickedPrice ? '已点击 Price，重新展开菜单核对选中项' : '已尝试展开 Sort，等待 Price 选项出现';
+          if (sorting.button && !sorting.button.disabled && sorting.button.getAttribute('aria-disabled') !== 'true' && Date.now() - lastOpenAt >= 1500) {
+            // Selecting Price may immediately unmount the menu while the trigger
+            // still says Sort ... . Reopen it and read SortItem-activeButton.
+            sorting.button.click();
+            lastOpenAt = Date.now();
+          }
+        } else {
+          reason = clickedPrice ? '已点击 Price，但官网尚未显示 Price 选中' : 'Sort 菜单中未找到可用的 Price 选项';
         }
       }
+      stats.sortStep = reason;
+      setMessage(reason + '（已等待 ' + Math.floor((Date.now() - start) / 1000) + ' 秒 / 最多 ' + MAX_SETTLE_MS / 1000 + ' 秒）');
       await sleep(500);
     }
-    return priceSortState(document);
+    const final = priceSortState(document);
+    stats.sortStep = final.ok ? 'Price · 从低到高' : '未能选中 Price：' + reason;
+    return {...final, reason};
   }
   function fingerprint(result) {
     return JSON.stringify([result.total, result.page.current, result.page.last, result.listings.map(item => [item.url, item.rent, item.status])]);
@@ -493,8 +536,10 @@
           stable = signature === previous ? stable + 1 : 1;
           previous = signature;
           if (Date.now() - start >= MIN_SETTLE_MS && stable >= 3) return result;
+          lastError = '等待房源列表稳定';
         } else { stable = 0; lastError = '正在等待分页内容更新'; }
       } catch (error) { stable = 0; lastError = error.message; }
+      setMessage(lastError + '（已等待 ' + Math.floor((Date.now() - start) / 1000) + ' 秒 / 最多 ' + MAX_SETTLE_MS / 1000 + ' 秒）');
       await sleep(1000);
     }
     throw Error(lastError + '；本轮未完成，后续页面变化会重试');
@@ -597,7 +642,7 @@
     deliveryContext = null;
     const scope = scopeFor(filters);
     const targets = targetsFor(filters);
-    Object.assign(stats, {scope, mode: '', sent: 0, scanned: 0, matched: 0, pages: 0});
+    Object.assign(stats, {scope, mode: '', sortStep: '', sent: 0, scanned: 0, matched: 0, pages: 0});
     lastScope = scope;
     try {
       while (manual && Date.now() < maintenanceUntil) {
@@ -613,7 +658,7 @@
       if (!singlePage(result)) {
         const sorting = await ensurePriceSort(scope, manual);
         if (!sorting.ok && filters.allCities) {
-          throw Error('未能选中 Price；请展开 Sort 检查价格按钮后重试（无需选择城市）');
+          throw Error('未能选中 Price：' + sorting.reason + '；请手动展开 Sort 选择 Price 后点击“立即检查”');
         }
         mode = sorting.ok ? 'budget' : 'city';
         setStatus('已开始，等待列表稳定', mode === 'budget' ? '已选择 Price 升序，遇到主租金 > €' + MAX_RENT + ' 后停止翻页'
