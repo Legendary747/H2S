@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.11
+// @version      1.3.12
 // @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -90,6 +90,9 @@
   }
   function directStatus(value) {
     return /^(book directly|available to book)$/i.test(clean(value));
+  }
+  function occupiedStatus(value) {
+    return /^occupied$/i.test(clean(value));
   }
   function cardsFromDocument(doc) {
     const known = [...doc.querySelectorAll('.residence_MainSection .residence_block')];
@@ -588,7 +591,7 @@
   let daytime = withinHours();
   let maintenanceUntil = 0;
   let networkRefreshPending = false;
-  const stats = {message: '正在启动', phase: '未开始', sortStep: '', mode: '', scope: '', scanned: 0, matched: 0, pages: 0, telegram: '未配置', sent: 0};
+  const stats = {message: '正在启动', phase: '未开始', sortStep: '', mode: '', scope: '', scanned: 0, matched: 0, occupied: 0, pages: 0, telegram: '未配置', sent: 0};
   const panelColors = {normal: '#e6edf5', muted: '#a6b8cb', info: '#7dd3fc', success: '#86efac', warning: '#fcd34d', error: '#fda4af'};
   const panelBackgrounds = {normal: '#162638', muted: '#162638', info: '#142d41', success: '#16332f', warning: '#352d20', error: '#38232e'};
   function panelNode(tag, value, style = {}) {
@@ -686,7 +689,7 @@
       : /暂停|重试/.test(phase) ? 'warning' : scanRunning || deliveryRunning ? 'info' : /完成/.test(phase) ? 'success' : 'muted';
     const header = panelNode('div', null, {display: 'flex', alignItems: 'center', justifyContent: 'space-between'});
     header.append(panelNode('strong', 'H2S', {fontSize: '21px', color: '#f0f9ff', letterSpacing: '0.5px'}),
-      panelNode('span', 'v1.3.11', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
+      panelNode('span', 'v1.3.12', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
     const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + maxRent(), {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
     const statusCard = panelNode('div', null, {background: panelBackgrounds[tone], borderLeft: '3px solid ' + panelColors[tone],
       borderRadius: '8px', padding: '9px 11px', marginBottom: '10px'});
@@ -696,6 +699,8 @@
     counts.append(panelNumbers('已读 ' + (sameScope ? stats.scanned : previous?.inspected || 0) + ' 套 · 符合 ' +
       (sameScope ? stats.matched : previous?.matched || 0) + ' 套 · 第 ' + (sameScope ? stats.pages : previous?.pages || 0) + ' 页'),
       panelNumbers('本轮已发 ' + (sameScope ? stats.sent : 0) + ' · 当前范围待发 ' + pending + ' · 累计 ' + history.sent));
+    const occupied = sameScope ? stats.occupied : previous?.occupied || 0;
+    if (occupied) counts.append(panelNode('div', '已跳过 ' + occupied + ' 套已租出房源（仍计入已读）', {color: panelColors.muted}));
     const details = panelNode('div');
     details.append(panelRow('当前城市', filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
       panelRow('可订状态', filters.availability || '未筛选（仅通知可直接预订）'),
@@ -824,7 +829,9 @@
         const currentFilters = filterState(document);
         const selectedCity = currentFilters.city;
         if (selectedCity && result.listings.some(item => !matchesCity(item.city, selectedCity))) throw Error('等待列表切换到所选城市');
-        if (currentFilters.availability === 'Available to book' && result.listings.some(item => !directStatus(item.status))) throw Error('等待列表切换到 Available to book');
+        // A just-rented residence can linger under Available to book. Keep it in
+        // count/order validation; reconcile excludes it from notifications.
+        if (currentFilters.availability === 'Available to book' && result.listings.some(item => !directStatus(item.status) && !occupiedStatus(item.status))) throw Error('等待列表切换到 Available to book');
         if (requireAscending && result.listings.some((item, index) => index && item.rent < result.listings[index - 1].rent)) throw Error('等待价格升序生效');
         const signature = fingerprint(result);
         const correctPage = !expectedPage || result.page.current === expectedPage;
@@ -1089,7 +1096,7 @@
     deliveryContext = null;
     const scope = scopeFor(filters);
     const targets = targetsFor(filters);
-    Object.assign(stats, {scope, mode: '', sortStep: '', sent: 0, scanned: 0, matched: 0, pages: 0});
+    Object.assign(stats, {scope, mode: '', sortStep: '', sent: 0, scanned: 0, matched: 0, occupied: 0, pages: 0});
     lastScope = scope;
     try {
       while (manual && Date.now() < maintenanceUntil) {
@@ -1130,6 +1137,7 @@
         listings.push(...result.listings);
         stats.scanned = listings.length;
         stats.matched = listings.filter(item => matchesCity(item.city, targets) && item.rent <= maxRent() && directStatus(item.status)).length;
+        stats.occupied = listings.filter(item => occupiedStatus(item.status)).length;
         stats.pages = n;
         setStatus('扫描中', '正在读取第 ' + n + ' 页；当前列表共 ' + total + ' 套');
         if ((useCutoff && result.listings.some(item => item.rent > maxRent())) || !result.page.next) break;
@@ -1157,7 +1165,7 @@
         history.cities[key] = state;
       }
       history.scans ||= {};
-      history.scans[scope] = {completedAt: Date.now(), inspected: listings.length, matched: stats.matched, pages: stats.pages, total, cutoff, mode};
+      history.scans[scope] = {completedAt: Date.now(), inspected: listings.length, matched: stats.matched, occupied: stats.occupied, pages: stats.pages, total, cutoff, mode};
       set('state', history);
       set('scanFailure', null);
       retryAt = 0;

@@ -552,6 +552,74 @@ test('Availability changes during pagination cancel the scan; stale lottery card
   await drain();assert.equal(stale.history,undefined);assert.equal(stale.messages.length,0);
   assert.match(stale.panel,/等待列表切换到 Available to book/);
 });
+test('Occupied cards lingering in Available to book count as inspected without blocking other notifications',async()=>{
+  for(const cityFilter of [null,'The Hague']){
+    const rows=priced([850,900]);rows[0].status='  oCcUpIeD  ';
+    const app=harness({cityFilter,availability:'Available to book',pages:[rows],configured:true});await drain();
+    assert.ok(app.history,app.panel);
+    assert.equal(app.messages.length,1);assert.match(app.messages[0].text,/r900-1\.html/);
+    assert.equal(rowsOf(app.history).find(item=>item.url===rows[0].url).eligible,false);
+    assert.equal(rowsOf(app.history).find(item=>item.url===rows[0].url).pending,null);
+    const scan=Object.values(app.history.scans)[0];
+    assert.equal(scan.inspected,2);assert.equal(scan.matched,1);assert.equal(scan.occupied,1);
+    assert.match(app.panel,/已跳过 1 套已租出房源/);
+    assert.equal(app.storage.get(app.prefix+'scanFailure')?.count || 0,0);
+    await check(app);assert.equal(app.messages.length,1,'the available residence still uses normal deduplication');
+  }
+});
+test('Occupied cards preserve pagination counts and the sorted budget cutoff',async()=>{
+  const rows=priced([800,900,1001,1100,1200]);rows[0].status='Occupied';rows[2].status='Occupied';
+  const app=harness({availability:'Available to book',pages:[[rows[0]],[rows[1]],[rows[2],rows[3]],[rows[4]]],configured:true});await drain();
+  assert.ok(app.history,app.panel);assert.deepEqual(app.visited,[1,2,3]);
+  assert.equal(app.messages.length,1);assert.match(app.messages[0].text,/r900-1\.html/);
+  const scan=Object.values(app.history.scans)[0];
+  assert.equal(scan.total,5);assert.equal(scan.inspected,4);assert.equal(scan.occupied,2);
+  assert.equal(scan.matched,1);assert.equal(scan.pages,3);assert.equal(scan.cutoff,true);
+  assert.equal(rowsOf(app.history).length,4,'unavailable cards remain part of the validated scan');
+  assert.equal(app.storage.get(app.prefix+'scanFailure')?.count || 0,0);
+});
+test('An all-Occupied result completes without accumulating failures and can recover an existing fault pause',async()=>{
+  let storage;
+  for(let attempt=0;attempt<4;attempt++){
+    const app=harness({availability:'Available to book',pages:[[sample({status:'Occupied'})]],configured:true,initialStorage:storage});await drain();
+    assert.ok(app.history,app.panel);assert.equal(app.messages.length,0);
+    const scan=Object.values(app.history.scans)[0];
+    assert.equal(scan.inspected,1);assert.equal(scan.matched,0);assert.equal(scan.occupied,1);
+    assert.equal(app.storage.get(app.prefix+'scanFailure')?.count || 0,0);
+    storage=app.storage;
+  }
+  storage.set('h2s_single_city_den_haag:scanFailure',{count:3,paused:true,retryAt:0,noticeSent:true,reason:'等待列表切换到 Available to book'});
+  const resumed=harness({availability:'Available to book',pages:[[sample({status:'Occupied'})]],configured:true,initialStorage:storage});await drain();
+  assert.match(resumed.panel,/故障暂停/);
+  resumed.menus.get('恢复故障暂停并立即检查')();await drain();
+  assert.equal(resumed.storage.get(resumed.prefix+'scanFailure')?.count || 0,0);
+  assert.match(resumed.panel,/已跳过 1 套已租出房源/);assert.equal(resumed.messages.length,0);
+});
+test('Becoming Occupied clears an unsent notification; becoming bookable again creates a fresh notification',async()=>{
+  const options={availability:'Available to book',configured:true};
+  const failed=harness({...options,pages:[[sample()]],onRequest:()=> 'error'});await drain();
+  assert.ok(rowsOf(failed.history)[0].pending);assert.equal(failed.messages.length,0);
+  const occupied=harness({...options,pages:[[sample({status:'Occupied'})]],initialStorage:failed.storage,startTime:failed.now});await drain();
+  assert.equal(rowsOf(occupied.history)[0].pending,null,occupied.panel);
+  assert.equal(rowsOf(occupied.history)[0].eligible,false);assert.equal(occupied.messages.length,0);
+  const available=harness({...options,pages:[[sample()]],initialStorage:occupied.storage,startTime:occupied.now+120000});await drain();
+  assert.equal(available.messages.length,1,available.panel);
+  assert.match(available.messages[0].text,/变为可直接预订/);
+  assert.equal(rowsOf(available.history)[0].pending,null);
+  await check(available);assert.equal(available.messages.length,1);
+});
+test('Occupied tolerance does not accept missing prices, wrong cities, or incomplete result counts',async()=>{
+  const cases=[
+    {change:doc=>{doc.querySelector('.price_text').textContent='Loading';},reason:/主租金标签缺失/},
+    {change:doc=>{doc.querySelector('.total_residence .count').textContent='2';},reason:/不完整/},
+    {row:{city:'Rotterdam',title:'Example 1, Rotterdam'},reason:/等待列表切换到所选城市/}
+  ];
+  for(const item of cases){
+    const app=harness({cityFilter:'The Hague',availability:'Available to book',pages:[[sample({status:'Occupied',...item.row})]],configured:true,startTime:'2026-10-03T22:00:00Z'});
+    await drain();item.change?.(app.document);await check(app);
+    assert.equal(app.history,undefined);assert.equal(app.messages.length,0);assert.match(app.panel,item.reason);
+  }
+});
 test('Availability-only global bare Price scans all pages without inventing a city',async()=>{
   const app=harness({availability:'Available to book',sortMode:'price',configured:true});await drain();
   assert.equal(app.history.sent,2);assert.equal(app.messages.length,2);
