@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.12
-// @description  Scan H2S by Price (ascending), stop above the main-rent budget, and preserve resumable alerts for five cities.
+// @version      1.3.13
+// @description  Scan H2S with combined city filters by ascending Price, stop above the rent budget, and preserve resumable alerts.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
 // @grant        GM_getValue
@@ -18,9 +18,17 @@
 (async () => {
   'use strict';
 
-  // Without a City filter, scan all cities by ascending price and locally match this list.
-  // With one City selected, scan only that city if it belongs to this list.
+  // Prefer the combined five-city URL; a selected subset or no City filter also works.
   const TARGET_CITIES = ['The Hague', 'Rijswijk', 'Rotterdam', 'Leiden', 'Zoetermeer'];
+  const CITY_FILTER_VALUES = ['The Hague,90', 'Rijswijk,6224', 'Zoetermeer,6088', 'Rotterdam,25', 'Leiden,6293'];
+  function fiveCityUrl() {
+    const url = new URL('https://www.holland2stay.com/residences');
+    url.searchParams.set('page', '1');
+    url.searchParams.set('available_to_book[filter]', 'Available to book,179');
+    // set() would replace earlier cities; append() preserves all five values.
+    for (const value of CITY_FILTER_VALUES) url.searchParams.append('city[filter]', value);
+    return url.href;
+  }
   const DEFAULT_MAX_RENT = 1000;
   // Keep the original @name and prefix so an in-place update preserves Telegram configuration.
   const STORAGE_PREFIX = 'h2s_single_city_den_haag';
@@ -44,6 +52,9 @@
   }
   const cityKeys = targets => [...new Set((Array.isArray(targets) ? targets : [targets]).map(cityKey))].sort();
   const matchesCity = (city, targets) => cityKeys(targets).includes(cityKey(city));
+  const sameCities = (left, right) => JSON.stringify(cityKeys(left)) === JSON.stringify(cityKeys(right));
+  // Retain existing global/single-city scope IDs and normalize multi-city order.
+  const selectionScope = filters => filters.allCities ? '*' : filters.cities.length === 1 ? cityKey(filters.city) : cityKeys(filters.cities);
   const CITY_LABEL = TARGET_CITIES.join(', ');
   function money(value) {
     let number = clean(value).replace(/[€\s\u00a0]/g, '');
@@ -147,7 +158,7 @@
     if (!doc.querySelector('.residence_MainSection')) throw Error('无法确认房源列表区域');
     return {listings, total, page: pagination(doc)};
   }
-  function filterState(doc) {
+  function filterState(doc, href = doc.location?.href || doc.URL || (typeof location !== 'undefined' ? location.href : '')) {
     const root = doc.querySelector('.selected_filter [aria-label="Current Filters"]');
     if (!root) return {ok: false, city: '', cities: [], wanted: false, reason: '等待官网城市筛选加载'};
     // H2S renders its Clear all filters action as a sibling <li> of the selected
@@ -184,7 +195,8 @@
         : /^city(?:\s*[:：-]|\s+)/i.test(label) || matchesCity(name, TARGET_CITIES) || options.has(cityKey(name)) ? 'city' : 'other';
       return {name, kind};
     }).filter(chip => chip.name);
-    const names = [...new Map([...checkedNames, ...chips.filter(chip => chip.kind === 'city').map(chip => chip.name)]
+    const chipCities = chips.filter(chip => chip.kind === 'city').map(chip => chip.name);
+    const names = [...new Map([...checkedNames, ...chipCities]
       .map(name => [cityKey(name), name])).values()];
     const checkedAvailability = availabilityInputs.filter(selected);
     const checkedAvailabilityNames = checkedAvailability.map(optionName).filter(Boolean);
@@ -197,14 +209,36 @@
     const otherInputs = [...doc.querySelectorAll('[aria-label^="Filter products by "] input[type="checkbox"], [aria-label^="Filter products by "] input[type="radio"]')]
       .some(input => selected(input) && !cityRoot?.contains(input) && !availabilityRoot?.contains(input));
     const otherChips = chips.filter(chip => chip.kind === 'other');
+    let urlReason = '';
+    if (href) {
+      try {
+        const params = new URL(href).searchParams;
+        const requested = params.getAll('city[filter]');
+        if (requested.length) {
+          const valid = requested.every(value => CITY_FILTER_VALUES.some(expected => {
+            const [name, id] = expected.split(',');
+            const parts = value.split(',');
+            return parts.length === 2 && cityKey(parts[0]) === cityKey(name) && parts[1] === id;
+          }));
+          if (!valid) urlReason = 'URL 中包含无法识别的城市筛选；请使用目标五城入口';
+          else if (!sameCities(requested.map(value => value.split(',')[0]), names)) urlReason = 'URL 与页面选中的城市不一致；等待全部城市筛选生效';
+        }
+        const availabilityParams = params.getAll('available_to_book[filter]');
+        if (!urlReason && availabilityParams.length &&
+            (availabilityParams.some(value => value !== 'Available to book,179') || availability !== 'Available to book')) {
+          urlReason = 'URL 与页面可订状态不一致；请只保留 Available to book';
+        }
+      } catch { urlReason = '无法读取当前筛选 URL'; }
+    }
     let reason = '';
     if (checked.length !== checkedNames.length) reason = '无法识别选中的城市名称；请展开 City 筛选';
-    else if (names.length > 1) reason = '一次只扫描一个城市；请只保留一个 City 选项';
+    else if (inputs.length && chipCities.length && !sameCities(checkedNames, chipCities)) reason = '城市勾选项与筛选标签不一致；等待页面完成切换';
     else if (!wanted) reason = '当前城市不在目标五城中，不开始扫描';
     else if (checkedAvailability.length !== checkedAvailabilityNames.length) reason = '无法识别可订状态；请展开 Availability 筛选';
     else if (availabilityNames.length > 1 || (availability && availability !== 'Available to book')) reason = 'Availability 请只选择 Available to book，或清除可订状态筛选';
-    else if (otherInputs || otherChips.length || (text(filterList) && !chips.length)) reason = '请清除其他网页筛选；可保留一个目标 City 和 Available to book'
+    else if (otherInputs || otherChips.length || (text(filterList) && !chips.length)) reason = '请清除其他网页筛选；可保留多个目标 City 和 Available to book'
       + (otherChips.length ? '；未支持的筛选：' + otherChips.map(chip => chip.name).join(', ') : '');
+    else if (urlReason) reason = urlReason;
     return {ok: !reason, city, cities: names, wanted, allCities, availability, reason};
   }
   // Site convention explicitly chosen by the user: both bare sort labels are
@@ -228,7 +262,7 @@
   const isPriceChoice = isAscendingPrice;
   function sortContext(doc) {
     const filters = filterState(doc);
-    return filters.ok ? JSON.stringify([filters.allCities ? '*' : cityKey(filters.city), filters.availability || '']) : null;
+    return filters.ok ? JSON.stringify([selectionScope(filters), filters.availability || '']) : null;
   }
   function forgetPriceSort(doc) { sortSelections.delete(doc); }
   function visibleSortNode(doc, node) {
@@ -543,7 +577,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {cityKey, cityKeys, matchesCity, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
       filterState, sortChoice, isAscendingPrice, isPriceChoice, priceSortState, forgetPriceSort, sortOptions, challenge, withinHours, validateSweep, validateBudgetSweep,
-      cityScope, historyFrom, freshState, reconcile, deliverPending, parseBudget, nextScanFailure,
+      cityScope, historyFrom, freshState, reconcile, deliverPending, parseBudget, nextScanFailure, fiveCityUrl, selectionScope,
       h2sDataUrl, h2sRetryAt, classifyH2SResponse, installH2SNetworkObserver};
     return;
   }
@@ -630,11 +664,14 @@
     border: '1px solid #4bbbbb', borderRadius: '9px', background: 'linear-gradient(120deg, #116b70, #155b76)',
     color: '#f0fdfa', font: '600 13px/1.5 system-ui,sans-serif', cursor: 'pointer'});
   checkButton.addEventListener('click', safe(async () => { requireIdle(); await runScan(true); }));
-  panel.append(panelText, checkButton);
+  const entryLink = panelNode('a', '打开五城市可订房源', {display: 'block', color: panelColors.info,
+    textAlign: 'center', marginTop: '8px', fontSize: '12px'});
+  entryLink.href = fiveCityUrl();
+  panel.append(panelText, checkButton, entryLink);
   function configured() { return Boolean(get('token', '') && get('chatId', '')); }
   const readHistory = () => historyFrom(get('state', null));
-  const targetsFor = filters => filters.allCities ? TARGET_CITIES : filters.city ? [filters.city] : [];
-  const scopeFor = filters => JSON.stringify(['price-asc-v1', filters.allCities ? '*' : cityKey(filters.city), maxRent(),
+  const targetsFor = filters => filters.allCities ? TARGET_CITIES : filters.cities;
+  const scopeFor = filters => JSON.stringify(['price-asc-v1', selectionScope(filters), maxRent(),
     ...(filters.availability ? ['availability:' + filters.availability] : [])]);
   const queuedItems = (history, filters) => Object.values(history.cities).flatMap(state => Object.values(state.items))
     .filter(item => item.pending && item.eligible && !item.missing && item.rent <= maxRent() && matchesCity(item.city, targetsFor(filters)));
@@ -689,7 +726,7 @@
       : /暂停|重试/.test(phase) ? 'warning' : scanRunning || deliveryRunning ? 'info' : /完成/.test(phase) ? 'success' : 'muted';
     const header = panelNode('div', null, {display: 'flex', alignItems: 'center', justifyContent: 'space-between'});
     header.append(panelNode('strong', 'H2S', {fontSize: '21px', color: '#f0f9ff', letterSpacing: '0.5px'}),
-      panelNode('span', 'v1.3.12', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
+      panelNode('span', 'v1.3.13', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
     const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + maxRent(), {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
     const statusCard = panelNode('div', null, {background: panelBackgrounds[tone], borderLeft: '3px solid ' + panelColors[tone],
       borderRadius: '8px', padding: '9px 11px', marginBottom: '10px'});
@@ -713,6 +750,7 @@
       : networkObserver.fetch || networkObserver.xhr ? '部分可用；其余依赖页面检查' : '不可用；仅使用页面检查',
       networkObserver.fetch && networkObserver.xhr ? 'muted' : 'warning'));
     if (mode === 'city') details.append(panelRow('扫描方式', '读完当前城市全部页，再按预算筛选', 'info'));
+    else if (filters.ok && filters.cities.length > 1) details.append(panelRow('扫描方式', '所选 ' + filters.cities.length + ' 城联合列表；多页按 Price 升序扫描', 'info'));
     if (others > 0) details.append(panelNode('div', '其他城市 / 范围待复查 ' + others + ' 条', {color: panelColors.warning}));
     const telegramLabel = configured() ? stats.telegram === '未配置' ? '已配置' : stats.telegram : '未配置（菜单设置）';
     details.append(panelRow('Telegram', telegramLabel, !configured() ? 'warning' : /失败|错误|异常|超时|HTTP|限流/.test(telegramLabel)
@@ -827,8 +865,7 @@
         if (priceSortState(document).root?.getAttribute('aria-busy') === 'true') throw Error('等待排序加载');
         const result = parsePage(document);
         const currentFilters = filterState(document);
-        const selectedCity = currentFilters.city;
-        if (selectedCity && result.listings.some(item => !matchesCity(item.city, selectedCity))) throw Error('等待列表切换到所选城市');
+        if (!currentFilters.allCities && result.listings.some(item => !matchesCity(item.city, currentFilters.cities))) throw Error('等待列表切换到所选城市');
         // A just-rented residence can linger under Available to book. Keep it in
         // count/order validation; reconcile excludes it from notifications.
         if (currentFilters.availability === 'Available to book' && result.listings.some(item => !directStatus(item.status) && !occupiedStatus(item.status))) throw Error('等待列表切换到 Available to book');
@@ -1111,7 +1148,7 @@
       let mode = 'single';
       if (!singlePage(result)) {
         const sorting = await ensurePriceSort(scope, manual);
-        if (!sorting.ok && filters.allCities) {
+        if (!sorting.ok && (filters.allCities || filters.cities.length > 1)) {
           throw Error('未能选中 Price：' + sorting.reason + '；请手动展开 Sort 选择 Price 后点击“立即检查”');
         }
         mode = sorting.ok ? 'budget' : 'city';
@@ -1147,8 +1184,9 @@
         result = await stablePage(scope, manual, n + 1, old, useCutoff);
       }
       let cutoff = false;
-      if (useCutoff) ({cutoff} = validateBudgetSweep(listings, total, maxRent(), filters.city, !result.page.next));
-      else validateSweep(listings, total, filters.city);
+      const selectedCities = filters.allCities ? null : filters.cities;
+      if (useCutoff) ({cutoff} = validateBudgetSweep(listings, total, maxRent(), selectedCities, !result.page.next));
+      else validateSweep(listings, total, selectedCities);
       assertAllowed(scope, manual, useCutoff);
       const history = readHistory();
       const requested = name => get(name, false) === true || get(name, false) === scope;
@@ -1240,6 +1278,7 @@
     return filters;
   }
   function register(label, callback) { GM_registerMenuCommand(label, safe(callback)); }
+  register('打开五城市可订房源', () => { requireIdle(); location.assign(fiveCityUrl()); });
   register('配置 Telegram Token', () => {
     const value = prompt('粘贴 BotFather 提供的 Token（仅保存到 Tampermonkey，不写入代码）。留空取消。');
     if (!value) return;
