@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.13
+// @version      1.3.14
 // @description  Scan H2S with combined city filters by ascending Price, stop above the rent budget, and preserve resumable alerts.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -35,10 +35,14 @@
   const TIME_ZONE = 'Europe/Amsterdam';
   const START_HOUR = 7;
   const END_HOUR = 23;
-  const REFRESH_MINUTES = [5, 15];
-  const MIN_SETTLE_MS = 10000;
-  const MAX_SETTLE_MS = 30000;
-  const SORT_RETRY_MS = 3000;
+  const REFRESH_MINUTES = [5, 10];
+  // Speed up local scanning only; network timeouts and server cooldowns are separate.
+  const SCAN_SPEED = 3;
+  const scanDelay = ms => Math.ceil(ms / SCAN_SPEED);
+  const MIN_SETTLE_MS = scanDelay(10000);
+  const MAX_SETTLE_MS = scanDelay(30000);
+  const MANUAL_SETTLE_MS = scanDelay(30000);
+  const SORT_RETRY_MS = scanDelay(3000);
   const SORT_MAX_ATTEMPTS = 3;
   const MAX_PAGES = 50;
   const VERSION = 1;
@@ -79,9 +83,9 @@
     const amount = Number(input.replace(',', '.'));
     return Number.isFinite(amount) && amount > 0 && amount <= 100000 ? Math.round(amount * 100) / 100 : null;
   }
-  function nextScanFailure(previous, reason, now) {
+  function nextScanFailure(previous, reason, now, retryBaseMs = scanDelay(60000)) {
     const count = Math.min(3, Math.max(0, Number(previous?.count) || 0) + 1);
-    return {count, retryAt: count < 3 ? now + count * 60000 : 0, paused: count >= 3,
+    return {count, retryAt: count < 3 ? now + count * retryBaseMs : 0, paused: count >= 3,
       reason, noticeSent: false, noticeRetryAt: 0};
   }
   function rentFromText(value) {
@@ -726,7 +730,7 @@
       : /暂停|重试/.test(phase) ? 'warning' : scanRunning || deliveryRunning ? 'info' : /完成/.test(phase) ? 'success' : 'muted';
     const header = panelNode('div', null, {display: 'flex', alignItems: 'center', justifyContent: 'space-between'});
     header.append(panelNode('strong', 'H2S', {fontSize: '21px', color: '#f0f9ff', letterSpacing: '0.5px'}),
-      panelNode('span', 'v1.3.13', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
+      panelNode('span', 'v1.3.14', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
     const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + maxRent(), {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
     const statusCard = panelNode('div', null, {background: panelBackgrounds[tone], borderLeft: '3px solid ' + panelColors[tone],
       borderRadius: '8px', padding: '9px 11px', marginBottom: '10px'});
@@ -789,7 +793,7 @@
     if (readScanFailure().paused) throw cancelledError('连续扫描失败，监控已故障暂停');
     if (challenge(document)) throw cancelledError('检测到验证页面，已停止操作');
     if (!manual && !withinHours()) throw cancelledError('已进入夜间暂停时段');
-    if (!sending && Date.now() < maintenanceUntil) throw cancelledError('检测到手动操作，等待 30 秒后继续扫描');
+    if (!sending && Date.now() < maintenanceUntil) throw cancelledError('检测到手动操作，等待 ' + MANUAL_SETTLE_MS / 1000 + ' 秒后继续扫描');
   }
   function assertScope(scope, manual, sending = false) {
     assertRunning(manual, sending);
@@ -833,7 +837,7 @@
         } else if (!options.length) {
           reason = !sorting.button ? '未找到 Sort 按钮，等待控件加载'
             : attempts ? '已点击 Price，重新展开菜单核对选中项' : '已尝试展开 Sort，等待 Price 选项出现';
-          if (sorting.button && !sorting.button.disabled && sorting.button.getAttribute('aria-disabled') !== 'true' && Date.now() - lastOpenAt >= 1500) {
+          if (sorting.button && !sorting.button.disabled && sorting.button.getAttribute('aria-disabled') !== 'true' && Date.now() - lastOpenAt >= scanDelay(1500)) {
             // Selecting Price may immediately unmount the menu while the trigger
             // still says Sort ... . Reopen it and read SortItem-activeButton.
             sorting.button.click();
@@ -847,7 +851,7 @@
       }
       stats.sortStep = reason;
       setMessage(reason + '（已等待 ' + Math.floor((Date.now() - start) / 1000) + ' 秒 / 最多 ' + MAX_SETTLE_MS / 1000 + ' 秒）');
-      await sleep(500);
+      await sleep(scanDelay(500));
     }
     const final = priceSortState(document);
     stats.sortStep = final.ok ? 'Price · 从低到高' : '未能选中 Price：' + reason;
@@ -881,7 +885,7 @@
         } else { stable = 0; lastError = '正在等待分页内容更新'; }
       } catch (error) { stable = 0; lastError = error.message; }
       setMessage(lastError + '（已等待 ' + Math.floor((Date.now() - start) / 1000) + ' 秒 / 最多 ' + MAX_SETTLE_MS / 1000 + ' 秒）');
-      await sleep(1000);
+      await sleep(scanDelay(1000));
     }
     throw Error(lastError + '；本轮未完成，将按退避间隔重试');
   }
@@ -1044,8 +1048,8 @@
     deliveryContext = null;
     dirty = true;
     if (hold.kind === 'temporary') {
-      await recordScanFailure(Error(networkDescription(hold)));
-      // The second transient failure uses the shared 120-second backoff.
+      await recordScanFailure(Error(networkDescription(hold)), 60000);
+      // Network failures retain 60/120-second backoff, independent of local scan speed.
       const latest = readNetworkHold();
       if (latest?.started === hold.started && latest.kind === hold.kind) {
         latest.retryAt = Math.max(latest.retryAt, readScanFailure().retryAt || 0);
@@ -1095,13 +1099,13 @@
     await notifyNetworkHold(hold);
     return true;
   }
-  async function recordScanFailure(error) {
+  async function recordScanFailure(error, retryBaseMs) {
     nextRefresh = 0;
     deliveryContext = null;
     dirty = true;
     const previous = readScanFailure();
     if (previous.paused) return previous;
-    const failure = nextScanFailure(previous, error.message || String(error), Date.now());
+    const failure = nextScanFailure(previous, error.message || String(error), Date.now(), retryBaseMs);
     set('scanFailure', failure);
     retryAt = Math.max(failure.retryAt, maintenanceUntil);
     if (failure.paused) await notifyScanFailure();
@@ -1139,7 +1143,7 @@
       while (manual && Date.now() < maintenanceUntil) {
         assertScope(scope, manual, true);
         setStatus('已开始，等待手动操作稳定', '还有约 ' + Math.ceil((maintenanceUntil - Date.now()) / 1000) + ' 秒，然后自动扫描');
-        await sleep(Math.min(1000, maintenanceUntil - Date.now()));
+        await sleep(Math.min(scanDelay(1000), maintenanceUntil - Date.now()));
       }
       assertScope(scope, manual);
       setStatus('已开始，等待列表稳定', '正在确认当前城市、房源数量和分页');
@@ -1225,7 +1229,7 @@
       if (challenge(document)) {
         await notifyBlock();
       } else if (error.cancelled) {
-        retryAt = Math.max(Date.now() + 2000, maintenanceUntil);
+        retryAt = Math.max(Date.now() + scanDelay(2000), maintenanceUntil);
         setStatus('扫描已取消', error.message);
       } else {
         await recordScanFailure(error);
@@ -1262,7 +1266,7 @@
       return;
     }
     if (!daytime) { daytime = true; location.reload(); return; }
-    if (Date.now() < maintenanceUntil) { setStatus('等待手动操作结束', '30 秒观察期结束后继续扫描'); return; }
+    if (Date.now() < maintenanceUntil) { setStatus('等待手动操作结束', MANUAL_SETTLE_MS / 1000 + ' 秒观察期结束后继续扫描'); return; }
     if (nextRefresh && Date.now() >= nextRefresh) { location.reload(); return; }
     if (dirty && Date.now() >= scanRetryAt) { await runScan(); return; }
     render();
@@ -1381,7 +1385,7 @@
     });
     if (meaningful) {
       clearTimeout(debounce);
-      debounce = setTimeout(() => { dirty = true; retryAt = Math.max(retryAt, readScanFailure().retryAt || 0, Date.now() + 2000); }, 1200);
+      debounce = setTimeout(() => { dirty = true; retryAt = Math.max(retryAt, readScanFailure().retryAt || 0, Date.now() + scanDelay(2000)); }, scanDelay(1200));
     }
   });
   observer.observe(document.body, {childList: true, subtree: true, characterData: true});
@@ -1393,14 +1397,14 @@
   }, true);
   document.addEventListener('change', event => {
     if (event.target.closest?.('#filter_accordion,[aria-label^="Filter products by "]')) {
-      dirty = true; nextRefresh = 0; retryAt = Math.max(readScanFailure().retryAt || 0, Date.now() + 2000);
-      if (event.isTrusted) maintenanceUntil = Date.now() + 30000;
+      dirty = true; nextRefresh = 0; retryAt = Math.max(readScanFailure().retryAt || 0, Date.now() + scanDelay(2000));
+      if (event.isTrusted) maintenanceUntil = Date.now() + MANUAL_SETTLE_MS;
       render();
     }
   });
   document.addEventListener('click', event => {
     if (event.isTrusted && event.target.closest?.('.residence_pagination,#filter_accordion,.selected_filter,[data-cy="ProductSort-root"]')) {
-      maintenanceUntil = Date.now() + 30000;
+      maintenanceUntil = Date.now() + MANUAL_SETTLE_MS;
       if (!deliveryRunning) dirty = true;
     }
   });
@@ -1414,7 +1418,7 @@
   navigator.locks.request('h2s-monitor:' + STORAGE_PREFIX, async () => {
     isLeader = true;
     for (const signal of earlyNetworkSignals.splice(0)) await applyNetworkSignal(signal);
-    const interval = setInterval(safe(tick), 5000);
+    const interval = setInterval(safe(tick), scanDelay(5000));
     await tick();
     await new Promise(resolve => window.addEventListener('pagehide', resolve, {once: true}));
     clearInterval(interval);

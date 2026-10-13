@@ -913,7 +913,7 @@ test('a list that never reaches Available to book explains that sorting was not 
   assert.doesNotMatch(app.panel,/等待选择 Price/);
 });
 test('Sort control mounted after the first list check is awaited and selected',async()=>{
-  const app=harness({actualSortControls:true,sortMode:'unset',sortDelay:14000,configured:true});
+  const app=harness({actualSortControls:true,sortMode:'unset',sortDelay:7000,configured:true});
   await drain();
   assert.equal(app.sortOptionClicks,1);assert.equal(app.messages.length,2,app.panel);
   assert.match(app.panel,/本轮已完成/);
@@ -980,8 +980,8 @@ test('a dispatched label press sequence still needs website confirmation before 
   await drain();assert.equal(app.sortOptionClicks,3);assert.equal(app.history,undefined);
   assert.equal(app.messages.length,0);assert.deepEqual(app.visited,[1]);assert.match(app.panel,/未能选中 Price/);
 });
-test('a pending sort request is allowed to finish without retry clicks while aria-busy',async()=>{
-  const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',sortBusyMs:10000,configured:true});
+test('a pending sort request within the 10-second limit finishes without retry clicks while aria-busy',async()=>{
+  const app=harness({actualSortControls:true,dateTrigger:true,sortMode:'unset',sortBusyMs:3000,configured:true});
   await drain();assert.equal(app.messages.length,2,app.panel);
   assert.equal(app.sortOptionClicks,1,'do not retry an in-flight sort request');
 });
@@ -1080,17 +1080,17 @@ test('budget menu rejects invalid amounts and cancellation without changing save
   assert.equal(app.storage.get(prefix+'maxRent'),999.5,'a decimal comma is accepted');
 });
 
-test('three ordinary failures back off for 60/120 seconds, persist a pause, and send one failure notice until explicit recovery',async()=>{
+test('three ordinary failures back off for 20/40 seconds, persist a pause, and send one failure notice until explicit recovery',async()=>{
   const app=harness({sortMode:'unset',canSort:false,configured:true});await drain();
   const failure=()=>app.storage.get(app.prefix+'scanFailure');
-  assert.equal(failure().count,1);assert.equal(failure().retryAt-app.now,60000);
+  assert.equal(failure().count,1);assert.equal(failure().retryAt-app.now,20000);
   const firstClicks=app.sortClicks;
-  app.advance(59000);app.tick();await drain();assert.equal(app.sortClicks,firstClicks);
+  app.advance(19000);app.tick();await drain();assert.equal(app.sortClicks,firstClicks);
   app.advance(1000);app.tick();await drain();
-  assert.equal(failure().count,2);assert.equal(failure().retryAt-app.now,120000);
+  assert.equal(failure().count,2);assert.equal(failure().retryAt-app.now,40000);
   assert.ok(app.sortClicks>firstClicks);assert.equal(app.messages.length,0);
   const secondClicks=app.sortClicks;
-  app.advance(119000);app.tick();await drain();assert.equal(app.sortClicks,secondClicks);
+  app.advance(39000);app.tick();await drain();assert.equal(app.sortClicks,secondClicks);
   app.advance(1000);app.tick();await drain();
   assert.equal(failure().count,3);assert.equal(failure().paused,true);
   assert.equal(app.messages.length,1);assert.equal(app.history,undefined);
