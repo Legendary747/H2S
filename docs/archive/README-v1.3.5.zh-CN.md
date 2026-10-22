@@ -1,3 +1,5 @@
+> Historical notes for this version only. For current installation and behavior, see the [English README](../../README.md) or [中文说明](../README.zh-CN.md). Test results below are historical, not validation of the current script.
+
 # H2S monitor v1.3.5 — Price 升序修复版
 
 ## 安装
@@ -47,7 +49,7 @@ node --check h2s-monitor.user.js
 ```
 
 已有系统 Chromium 时，可用 --chromium 指定可执行文件路径。
-结果见 browser-test-results.json。
+结果见 [历史 v1.3.5 测试报告](browser-test-results-v1.3.5.json)。
 
 ## 提交范围
 

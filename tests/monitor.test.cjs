@@ -17,7 +17,7 @@ const documentOf = () => parseHTML(fixture).document;
 const sample = (overrides = {}) => ({url: 'https://www.holland2stay.com/residences/example.html', title: 'Example 1, The Hague', city: 'The Hague', rent: 900, status: 'Book directly', ...overrides});
 const update = (state, rows, time = 100) => core.reconcile(state, rows, 'scope', 'Den Haag', 1000, time).state;
 
-test('actual uploaded page: 10 main rents, 109 total, 11 pages; service costs are excluded', () => {
+test('synthetic page: 10 main rents, 109 total, 11 pages; service costs are excluded', () => {
   const page = core.parsePage(documentOf());
   assert.equal(page.total, 109);
   assert.equal(page.page.current, 1);
@@ -66,7 +66,7 @@ test('recognizes global, one city or a target-city subset; rejects other cities 
   selected.remove();
   assert.equal(core.filterState(doc).ok,false);
 });
-test('actual The Hague filter markup accepts the city and ignores the Clear all filters action', () => {
+test('synthetic The Hague filter markup accepts the city and ignores the Clear all filters action', () => {
   const {document} = parseHTML(selectedCityFixture);
   assert.equal(document.querySelector('[data-cy="FilterSidebar-clearButton"]').textContent,'Clear all filters');
   const filters = core.filterState(document);
@@ -180,7 +180,7 @@ test('an invisible duplicate Sort root does not replace the visible control', ()
   const state=core.priceSortState(document);
   assert.ok(state.root===root,'use the visible root');assert.equal(state.ok,true);
 });
-test('uploaded The Hague page has nine unsorted listings, with only three direct-booking matches within €1500', () => {
+test('synthetic The Hague page has nine unsorted listings, with only three direct-booking matches within €1500', () => {
   const page=core.parsePage(parseHTML(selectedCityPage).document);
   assert.equal(page.total,9);assert.equal(page.page.last,1);assert.equal(page.page.next,null);
   assert.deepEqual(page.listings.map(item=>item.rent),[1720,1778,1278,1278,1628,1286,1224,829,802]);
@@ -321,7 +321,7 @@ test('Amsterdam time windows respect winter/summer time and 23:00 cutoff', () =>
   assert.equal(core.withinHours(new Date('2026-10-03T21:00:00Z')),false);
 });
 
-// Offline runtime harness: uploaded card markup, simulated site controls, virtual
+// Offline runtime harness: synthetic card markup, simulated site controls, virtual
 // clock, and mocked Telegram responses. No real network requests are made.
 function harness({pages, cityFilter = null, collapsedCity = false, extraFilter = false, actualCityControls = false,
   sortMode = 'asc', sortOptionLabel = 'Price: Low to High', sortOptionTag = 'button', canSort = true, configured = false, blocked = false, brokenPage = 0,
@@ -526,7 +526,7 @@ const check = async app => {app.menus.get('立即检查（允许在夜间手动�
 const rowsOf = history => Object.values(history.cities).flatMap(state=>Object.values(state.items));
 const priced = (rents,city='The Hague')=>rents.map((rent,i)=>sample({rent,city,title:'Example '+i+', '+city,url:sample().url.replace('example','r'+rent+'-'+i)}));
 
-// Synthetic multi-city cases extend the previously captured filter markup.
+// Synthetic multi-city cases extend the authored filter markup.
 // The user confirmed the five-city URL on H2S; these are offline regressions.
 const fiveCities = ['The Hague','Rotterdam','Rijswijk','Zoetermeer','Leiden'];
 test('combined entry keeps all five repeated city parameters, availability and page one', () => {
@@ -621,7 +621,7 @@ test('the entry menu and panel link use the same five-city URL without clearing 
   const entry=new URL(core.fiveCityUrl());
   assert.equal(link.origin+link.pathname,entry.origin+entry.pathname);
   assert.deepEqual([...link.searchParams],[...entry.searchParams]);
-  app.menus.get('打开五城市可订房源')();await drain();
+  app.menus.get('打开配置城市可订房源 / Open configured cities')();await drain();
   assert.deepEqual(app.navigations,[core.fiveCityUrl()]);assert.deepEqual([...app.storage],before);
   assert.equal(app.messages.length,0);
 });
@@ -852,7 +852,7 @@ test('one allowed city is scanned without Reset, including when City options are
   const app=harness({cityFilter:'The Hague',collapsedCity:true,configured:true});await drain();
   assert.equal(app.messages.length,2);assert.equal(app.resets,0);
   assert.match(app.panel,/当前城市：The Hague/);
-  assert.match(app.panel,/目标城市：是，属于目标五城/);
+  assert.match(app.panel,/目标城市：是，属于配置的目标城市/);
   assert.match(app.panel,/扫描状态：本轮已完成/);
   await check(app);assert.equal(app.messages.length,2);
 });
@@ -1232,5 +1232,148 @@ test('API challenge and 403 holds survive reload until the explicit interface-re
     assert.equal(reloaded.storage.get(reloaded.prefix+'networkHold'),null);
     const fresh=harness({configured:true,initialStorage:reloaded.storage,startTime:reloaded.now});await drain();
     assert.equal(fresh.history.sent,2);
+  }
+});
+
+const configMenu = '导入配置 JSON / Import settings JSON';
+const exportMenu = '导出配置 JSON / Export settings JSON';
+const settingsFor = overrides => ({...core.loadConfig(null, null), ...overrides});
+const configStorage = config => new Map([['h2s_single_city_den_haag:config', config]]);
+
+test('configured non-default cities drive filters, entry URL, local matching and notifications', async () => {
+  const config = settingsFor({cities:[{name:'Utrecht',id:'42'}],maxRent:950});
+  const params = new URLSearchParams({page:'1','city[filter]':'Utrecht,42','available_to_book[filter]':'Available to book,179'});
+  const pageUrl = 'https://www.holland2stay.com/residences?' + params;
+  const app = harness({initialStorage:configStorage(config),cityFilter:'Utrecht',availability:'Available to book',
+    pageUrl,pages:[priced([900,950,951],'Utrecht')],configured:true});
+  await drain();
+  assert.equal(app.messages.length,2,app.panel);
+  assert.match(app.panel,/目标城市：是，属于配置的目标城市/);
+  const entry = new URL(app.document.querySelector('#h2s-monitor-panel a').getAttribute('href'));
+  assert.deepEqual(entry.searchParams.getAll('city[filter]'),['Utrecht,42']);
+  assert.equal(app.history.cities.utrecht.sent,2);
+  const wrong = harness({initialStorage:configStorage(config),cityFilter:'Utrecht',availability:'Available to book',
+    pageUrl:pageUrl.replace('Utrecht%2C42','Utrecht%2C99'),pages:[priced([900],'Utrecht')],configured:true});
+  await drain();
+  assert.equal(wrong.messages.length,0);assert.equal(wrong.history,undefined);
+  assert.match(wrong.panel,/无法识别的城市筛选/);
+  const global = harness({initialStorage:configStorage(config),pages:[[...priced([800],'Utrecht'),...priced([900],'The Hague')]],configured:true});
+  await drain();
+  assert.equal(global.messages.length,1);assert.match(global.messages[0].text,/Utrecht/);
+  assert.equal(global.history.cities['den haag'],undefined);
+});
+
+test('JSON import preserves credentials and sent history while invalidating old scan summaries', async () => {
+  const config = settingsFor({cities:[{name:'The Hague',id:'90'},{name:'Utrecht',id:'42'}]});
+  const app = harness({configured:true,promptResponses:[JSON.stringify(config)]});await drain();
+  const previousCities = structuredClone(app.history.cities);
+  const token = app.storage.get(app.prefix+'token'), chatId = app.storage.get(app.prefix+'chatId');
+  app.menus.get(configMenu)();await drain();
+  assert.equal(app.reloads,1);
+  assert.deepEqual(app.storage.get(app.prefix+'config'),config);
+  assert.equal(app.storage.get(app.prefix+'maxRent'),1000);
+  assert.equal(app.storage.get(app.prefix+'token'),token);assert.equal(app.storage.get(app.prefix+'chatId'),chatId);
+  assert.deepEqual(app.history.cities,previousCities);assert.deepEqual(app.history.scans,{});
+  const updated = harness({initialStorage:app.storage,configured:true,pages:[[sample(),...priced([950],'Utrecht'),sample({rent:1000,url:sample().url.replace('example','second')})]]});
+  await drain();
+  assert.equal(updated.messages.length,1,updated.panel);assert.match(updated.messages[0].text,/Utrecht/);
+  assert.equal(updated.history.cities['den haag'].sent,2);
+});
+
+test('invalid or cancelled JSON imports cannot partially overwrite settings, secrets or history', async () => {
+  for (const raw of [null,'{','{}',JSON.stringify({...settingsFor(),token:'unexpected'})]) {
+    const app = harness({configured:true,promptResponses:[raw]});await drain();
+    const before = structuredClone([...app.storage]);
+    app.menus.get(configMenu)();await drain();
+    assert.deepEqual([...app.storage],before,String(raw));assert.equal(app.reloads,0);
+  }
+});
+
+test('downloaded configuration contains updated settings without Telegram secrets or listing history', async () => {
+  const app = harness({configured:true,promptResponses:['875.50']});await drain();
+  app.menus.get('设置预算（主租金上限）')();await drain();
+  let download;
+  app.document.addEventListener('click', event => {
+    if (event.target.download === 'h2s-config.json') download = event.target.getAttribute('href');
+  });
+  app.menus.get(exportMenu)();await drain();
+  assert.ok(download?.startsWith('data:application/json;charset=utf-8,'));
+  const exported = JSON.parse(decodeURIComponent(download.split(',').slice(1).join(',')));
+  assert.deepEqual(exported,settingsFor({maxRent:875.5}));
+  assert.doesNotMatch(JSON.stringify(exported),/offline_test_token|chatId|lastNotified|example\.html/);
+});
+
+test('configured hours and refresh interval govern runtime scheduling', async () => {
+  const config = settingsFor({activeHours:{start:'22:30',end:'01:15',timeZone:'Europe/Amsterdam'},refreshMinutes:[12,12]});
+  const early = harness({initialStorage:configStorage(config),configured:true,startTime:'2026-10-03T20:29:00Z'});await drain();
+  assert.equal(early.messages.length,0);assert.equal(early.history,undefined);
+  const active = harness({initialStorage:configStorage(config),configured:true,startTime:'2026-10-03T22:15:00Z'});await drain();
+  assert.equal(active.messages.length,2,active.panel);assert.match(active.panel,/22:30–01:15 · Europe\/Amsterdam/);
+  active.advance(719999);active.tick();await drain();assert.equal(active.reloads,0);
+  active.advance(1);active.tick();await drain();assert.equal(active.reloads,1);
+});
+
+test('invalid persisted configuration fails closed and can be repaired through import', async () => {
+  const valid = settingsFor();
+  const app = harness({initialStorage:configStorage({...valid,cities:[]}),configured:true,promptResponses:[JSON.stringify(valid)]});
+  await drain();
+  assert.equal(app.messages.length,0);assert.equal(app.history,undefined);assert.equal(app.sortClicks,0);assert.equal(app.reloads,0);
+  assert.match(app.panel,/配置已更改或无效，监控已暂停/);
+  await check(app);assert.equal(app.messages.length,0);assert.equal(app.history,undefined);
+  app.menus.get(configMenu)();await drain();assert.equal(app.reloads,1);
+  const repaired = harness({initialStorage:app.storage,configured:true});await drain();assert.equal(repaired.messages.length,2);
+});
+
+test('settings changed by another tab stop pending delivery and retain unsent history', async () => {
+  let app;
+  app = harness({configured:true,onRequest:({attempt}) => {
+    if (attempt === 1) app.storage.set(app.prefix+'config',settingsFor({cities:[{name:'Utrecht',id:'42'}]}));
+  }});
+  await drain();
+  assert.equal(app.messages.length,1);assert.equal(rowsOf(app.history).filter(item=>item.pending).length,1);
+  app.tick();await drain();assert.match(app.panel,/配置已更改或无效，监控已暂停/);
+  assert.equal(app.messages.length,1);assert.equal(app.reloads,0);
+});
+
+test('a stale tab cannot overwrite another tab settings by changing only its budget', async () => {
+  const app = harness({configured:true,promptResponses:['1500']});await drain();
+  const latest = settingsFor({cities:[{name:'Utrecht',id:'42'}],maxRent:850,refreshMinutes:[15,20]});
+  app.storage.set(app.prefix+'config',latest);
+  const before = structuredClone([...app.storage]);
+  app.menus.get('设置预算（主租金上限）')();await drain();
+  assert.deepEqual([...app.storage],before);
+  assert.match(app.panel,/请先刷新页面或重新导入配置/);
+});
+
+test('upgrading an untouched v1.3.14 install preserves a pending scoped silent reset', async () => {
+  for (const availability of [null,'Available to book']) {
+    const baseline = harness({configured:true,availability});await drain();
+    baseline.menus.get('清除历史并重建基线（不通知现有房源）')();await drain();
+    const legacyScope = JSON.stringify(['price-asc-v1','*',1000,...(availability?['availability:'+availability]:[])]);
+    baseline.storage.set(baseline.prefix+'silentBaseline',legacyScope);
+    assert.equal(baseline.storage.has(baseline.prefix+'config'),false);
+    const upgraded = harness({configured:true,availability,initialStorage:baseline.storage});await drain();
+    assert.equal(upgraded.messages.length,0,upgraded.panel);
+    assert.equal(upgraded.storage.get(upgraded.prefix+'silentBaseline'),false);
+    assert.ok(rowsOf(upgraded.history).every(item=>item.initialNoticeSkipped));
+    await check(upgraded);assert.equal(upgraded.messages.length,0);
+  }
+  // An old global request must not silently apply to a newly configured city set.
+  const storage = configStorage(settingsFor({cities:[{name:'Utrecht',id:'42'}]}));
+  storage.set('h2s_single_city_den_haag:silentBaseline',JSON.stringify(['price-asc-v1','*',1000]));
+  const custom = harness({configured:true,initialStorage:storage,pages:[priced([900],'Utrecht')]});await drain();
+  assert.equal(custom.messages.length,1,custom.panel);
+});
+
+test('upgrading an untouched v1.3.14 install honors a pending scoped force resend exactly once', async () => {
+  for (const availability of [null,'Available to book']) {
+    const baseline = harness({configured:true,availability});await drain();
+    const legacyScope = JSON.stringify(['price-asc-v1','*',1000,...(availability?['availability:'+availability]:[])]);
+    baseline.storage.set(baseline.prefix+'notifyExisting',legacyScope);
+    const upgraded = harness({configured:true,availability,initialStorage:baseline.storage});await drain();
+    assert.equal(upgraded.messages.length,2,upgraded.panel);
+    assert.ok(upgraded.messages.every(message=>message.text.includes('手动重新通知')));
+    assert.equal(upgraded.storage.get(upgraded.prefix+'notifyExisting'),false);
+    await check(upgraded);assert.equal(upgraded.messages.length,2);
   }
 });

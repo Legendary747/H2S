@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, 'refactor/make-public']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish v1.4.0 from this tested commit
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  # Do not interrupt publication midway through uploading release assets.
+  cancel-in-progress: false
+
+jobs:
+  offline-tests:
+    name: Node.js ${{ matrix.node }} · offline regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install locked development dependencies
+        run: npm ci --ignore-scripts
+      - name: Check userscript syntax
+        run: npm run check
+      - name: Run offline regression tests
+        run: npm test
+
+  release:
+    name: Publish v1.4.0
+    needs: offline-tests
+    if: >-
+      github.repository == 'Legendary747/H2S' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/refactor/make-public' &&
+        contains(github.event.head_commit.message, '[release]')) ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish_release &&
+        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/refactor/make-public')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-h2s-v1.4.0
+      cancel-in-progress: false
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Publish the verified tag and assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: bash scripts/release.sh

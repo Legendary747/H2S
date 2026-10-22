@@ -1,7 +1,7 @@
 """Offline Chromium regression suite. No H2S or Telegram requests are sent.
 Run: python tests/browser_regression.py [--source path/to/userscript] [--chromium /usr/bin/chromium]
 Requires Python playwright, plus an installed Chromium browser.
-Fixtures are sanitized DOM extracts from the user's two uploaded snapshots.
+Fixtures are authored synthetic DOM pages; see tests/fixtures/README.md.
 """
 import argparse
 import json
@@ -156,7 +156,7 @@ with sync_playwright() as pw:
         def snapshot_test(html=html,total=total,expected=expected):
             out=corepage.evaluate('html=>{const d=new DOMParser().parseFromString(html,"text/html");const p=core.parsePage(d);return {total:p.total,n:p.listings.length,f:core.filterState(d),rents:p.listings.map(x=>x.rent)};}',html)
             assert_that(out['total']==total and out['n']==expected and out['f']['ok'],str(out))
-        check('parse actual sanitized snapshot '+file,snapshot_test)
+        check('parse synthetic DOM fixture '+file,snapshot_test)
 
     def start(cfg=None,html=BASE,hour=12,manual=True):
         cfg=dict(cfg or {})
@@ -237,7 +237,7 @@ with sync_playwright() as pw:
         out=outcome(p)
         assert_that(getscan(out) and getscan(out)['inspected']==9 and len(out['calls']['messages'])==3,out['panel'])
         p.context.close()
-    check('actual The Hague snapshot: entire userscript reads 9 and queues 3 direct rentals',actual_snapshot)
+    check('synthetic The Hague fixture: entire userscript reads 9 and queues 3 direct rentals',actual_snapshot)
     def legacy_seed():
         item={'url':'https://www.holland2stay.com/residences/hague.html','title':'hague 1, The Hague','city':'The Hague','rent':900,'status':'Book directly','lastNotified':1,'eligible':True,'missing':0}
         history={'version':1,'sent':9,'initialized':True,'items':{item['url']:item}}

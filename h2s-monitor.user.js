@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         H2S — Den Haag housing monitor
 // @namespace    https://github.com/Legendary747/H2S
-// @version      1.3.14
+// @homepageURL  https://github.com/Legendary747/H2S
+// @license      MIT
+// @version      1.4.0
 // @description  Scan H2S with combined city filters by ascending Price, stop above the rent budget, and preserve resumable alerts.
 // @match        https://www.holland2stay.com/residences*
 // @match        https://holland2stay.com/residences*
@@ -18,24 +20,19 @@
 (async () => {
   'use strict';
 
-  // Prefer the combined five-city URL; a selected subset or no City filter also works.
-  const TARGET_CITIES = ['The Hague', 'Rijswijk', 'Rotterdam', 'Leiden', 'Zoetermeer'];
-  const CITY_FILTER_VALUES = ['The Hague,90', 'Rijswijk,6224', 'Zoetermeer,6088', 'Rotterdam,25', 'Leiden,6293'];
-  function fiveCityUrl() {
-    const url = new URL('https://www.holland2stay.com/residences');
-    url.searchParams.set('page', '1');
-    url.searchParams.set('available_to_book[filter]', 'Available to book,179');
-    // set() would replace earlier cities; append() preserves all five values.
-    for (const value of CITY_FILTER_VALUES) url.searchParams.append('city[filter]', value);
-    return url.href;
-  }
-  const DEFAULT_MAX_RENT = 1000;
-  // Keep the original @name and prefix so an in-place update preserves Telegram configuration.
+  // Keep the original @name and prefix so in-place updates preserve local data.
   const STORAGE_PREFIX = 'h2s_single_city_den_haag';
-  const TIME_ZONE = 'Europe/Amsterdam';
-  const START_HOUR = 7;
-  const END_HOUR = 23;
-  const REFRESH_MINUTES = [5, 10];
+  const DEFAULT_CONFIG = {
+    schemaVersion: 1,
+    cities: [
+      {name: 'The Hague', id: '90'}, {name: 'Rijswijk', id: '6224'},
+      {name: 'Zoetermeer', id: '6088'}, {name: 'Rotterdam', id: '25'},
+      {name: 'Leiden', id: '6293'}
+    ],
+    maxRent: 1000,
+    activeHours: {start: '07:00', end: '23:00', timeZone: 'Europe/Amsterdam'},
+    refreshMinutes: [5, 10]
+  };
   // Speed up local scanning only; network timeouts and server cooldowns are separate.
   const SCAN_SPEED = 3;
   const scanDelay = ms => Math.ceil(ms / SCAN_SPEED);
@@ -59,7 +56,86 @@
   const sameCities = (left, right) => JSON.stringify(cityKeys(left)) === JSON.stringify(cityKeys(right));
   // Retain existing global/single-city scope IDs and normalize multi-city order.
   const selectionScope = filters => filters.allCities ? '*' : filters.cities.length === 1 ? cityKey(filters.city) : cityKeys(filters.cities);
+  function requireFields(value, fields, label) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        Object.keys(value).length !== fields.length ||
+        fields.some(field => !Object.prototype.hasOwnProperty.call(value, field))) {
+      throw Error(label + ' must contain exactly: ' + fields.join(', '));
+    }
+  }
+  function validateConfig(value) {
+    requireFields(value, ['schemaVersion', 'cities', 'maxRent', 'activeHours', 'refreshMinutes'], 'Config');
+    if (value.schemaVersion !== 1) throw Error('Unsupported config schemaVersion; expected 1');
+    if (!Array.isArray(value.cities) || !value.cities.length || value.cities.length > 100) {
+      throw Error('cities must contain 1–100 city objects');
+    }
+    const cities = value.cities.map(city => {
+      requireFields(city, ['name', 'id'], 'City');
+      if (typeof city.name !== 'string' || city.name !== city.name.trim() ||
+          !/^[\p{L}\p{M}\p{N} .()'’–-]{1,80}$/u.test(city.name) || !/\p{L}/u.test(city.name)) {
+        throw Error('City name must be the official city label without commas or surrounding whitespace');
+      }
+      if (typeof city.id !== 'string' || !/^[1-9]\d{0,9}$/.test(city.id)) {
+        throw Error('City id must be the positive numeric ID from the H2S city filter URL, as a string');
+      }
+      return {name: city.name, id: city.id};
+    });
+    if (cityKeys(cities.map(city => city.name)).length !== cities.length ||
+        new Set(cities.map(city => city.id)).size !== cities.length) throw Error('Duplicate city name or ID');
+    if (typeof value.maxRent !== 'number' || parseBudget(value.maxRent) !== value.maxRent) {
+      throw Error('maxRent must be a number greater than 0 and at most 100000, with at most two decimal places');
+    }
+    requireFields(value.activeHours, ['start', 'end', 'timeZone'], 'activeHours');
+    const {start, end, timeZone} = value.activeHours;
+    if (![start, end].every(time => typeof time === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) || start === end) {
+      throw Error('activeHours start/end must be different HH:MM times (00:00–23:59)');
+    }
+    if (typeof timeZone !== 'string' || !timeZone || timeZone.length > 100) throw Error('Invalid timeZone');
+    try { new Intl.DateTimeFormat('en-GB', {timeZone}).format(new Date(0)); }
+    catch { throw Error('Unknown IANA timeZone'); }
+    if (!Array.isArray(value.refreshMinutes) || value.refreshMinutes.length !== 2 ||
+        value.refreshMinutes.some(minutes => typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes < 1 || minutes > 1440) ||
+        value.refreshMinutes[0] > value.refreshMinutes[1]) {
+      throw Error('refreshMinutes must be [minimum, maximum], 1–1440 minutes, in ascending order');
+    }
+    return {schemaVersion: 1, cities, maxRent: value.maxRent,
+      activeHours: {start, end, timeZone}, refreshMinutes: [...value.refreshMinutes]};
+  }
+  function parseConfig(json) {
+    if (typeof json !== 'string' || json.length > 50000) throw Error('Config JSON must be text of at most 50000 characters');
+    let value;
+    try { value = JSON.parse(json); } catch { throw Error('Invalid JSON; paste the complete contents of your config file'); }
+    return validateConfig(value);
+  }
+  function loadConfig(saved, legacyBudget) {
+    // New configurations are authoritative; the old budget is migrated only once.
+    if (saved !== null && saved !== undefined) return validateConfig(saved);
+    return validateConfig({...DEFAULT_CONFIG, maxRent: parseBudget(legacyBudget) ?? DEFAULT_CONFIG.maxRent});
+  }
+  let configStartupError = '';
+  let settings;
+  try {
+    settings = loadConfig(typeof GM_getValue === 'function' ? GM_getValue(STORAGE_PREFIX + ':config', null) : null,
+      typeof GM_getValue === 'function' ? GM_getValue(STORAGE_PREFIX + ':maxRent', null) : null);
+  } catch (error) {
+    // Fail closed instead of silently monitoring a different set of cities.
+    configStartupError = error.message;
+    settings = validateConfig(DEFAULT_CONFIG);
+  }
+  const TARGET_CITIES = settings.cities.map(city => city.name);
+  const CITY_FILTER_VALUES = settings.cities.map(city => city.name + ',' + city.id);
   const CITY_LABEL = TARGET_CITIES.join(', ');
+  const TIME_ZONE = settings.activeHours.timeZone;
+  const REFRESH_MINUTES = settings.refreshMinutes;
+  function configuredCityUrl() {
+    const url = new URL('https://www.holland2stay.com/residences');
+    url.searchParams.set('page', '1');
+    url.searchParams.set('available_to_book[filter]', 'Available to book,179');
+    for (const value of CITY_FILTER_VALUES) url.searchParams.append('city[filter]', value);
+    return url.href;
+  }
+  // Backwards-compatible helper name for existing integrations and tests.
+  const fiveCityUrl = configuredCityUrl;
   function money(value) {
     let number = clean(value).replace(/[€\s\u00a0]/g, '');
     if (!/^\d+(?:[.,]\d+)*$/.test(number)) return null;
@@ -224,7 +300,7 @@
             const parts = value.split(',');
             return parts.length === 2 && cityKey(parts[0]) === cityKey(name) && parts[1] === id;
           }));
-          if (!valid) urlReason = 'URL 中包含无法识别的城市筛选；请使用目标五城入口';
+          if (!valid) urlReason = 'URL 中包含无法识别的城市筛选；请使用配置的城市入口';
           else if (!sameCities(requested.map(value => value.split(',')[0]), names)) urlReason = 'URL 与页面选中的城市不一致；等待全部城市筛选生效';
         }
         const availabilityParams = params.getAll('available_to_book[filter]');
@@ -237,7 +313,7 @@
     let reason = '';
     if (checked.length !== checkedNames.length) reason = '无法识别选中的城市名称；请展开 City 筛选';
     else if (inputs.length && chipCities.length && !sameCities(checkedNames, chipCities)) reason = '城市勾选项与筛选标签不一致；等待页面完成切换';
-    else if (!wanted) reason = '当前城市不在目标五城中，不开始扫描';
+    else if (!wanted) reason = '当前城市不在配置的目标城市中，不开始扫描';
     else if (checkedAvailability.length !== checkedAvailabilityNames.length) reason = '无法识别可订状态；请展开 Availability 筛选';
     else if (availabilityNames.length > 1 || (availability && availability !== 'Available to book')) reason = 'Availability 请只选择 Available to book，或清除可订状态筛选';
     else if (otherInputs || otherChips.length || (text(filterList) && !chips.length)) reason = '请清除其他网页筛选；可保留多个目标 City 和 Available to book'
@@ -357,9 +433,13 @@
     const body = text(doc.body).slice(0, 5000);
     return /verify you are human|checking your browser|sorry, you have been blocked|403 forbidden/i.test(body);
   }
-  function withinHours(date = new Date()) {
-    const hour = Number(new Intl.DateTimeFormat('en-GB', {timeZone: TIME_ZONE, hour: '2-digit', hourCycle: 'h23'}).format(date));
-    return hour >= START_HOUR && hour < END_HOUR;
+  function withinHours(date = new Date(), hours = settings.activeHours) {
+    const parts = new Intl.DateTimeFormat('en-GB', {timeZone: hours.timeZone,
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23'}).formatToParts(date);
+    const minute = Number(parts.find(part => part.type === 'hour').value) * 60 + Number(parts.find(part => part.type === 'minute').value);
+    const minutes = time => Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
+    const start = minutes(hours.start), end = minutes(hours.end);
+    return start < end ? minute >= start && minute < end : minute >= start || minute < end;
   }
   function validateSweep(listings, total, city) {
     if (new Set(listings.map(item => item.url)).size !== total || listings.length !== total) throw Error('分页结果不完整或重复；本轮不更新历史');
@@ -581,7 +661,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {cityKey, cityKeys, matchesCity, money, rentFromText, normalizeUrl, directStatus, parseCard, parsePage, pagination,
       filterState, sortChoice, isAscendingPrice, isPriceChoice, priceSortState, forgetPriceSort, sortOptions, challenge, withinHours, validateSweep, validateBudgetSweep,
-      cityScope, historyFrom, freshState, reconcile, deliverPending, parseBudget, nextScanFailure, fiveCityUrl, selectionScope,
+      cityScope, historyFrom, freshState, reconcile, deliverPending, parseBudget, nextScanFailure, fiveCityUrl, configuredCityUrl, selectionScope, validateConfig, parseConfig, loadConfig,
       h2sDataUrl, h2sRetryAt, classifyH2SResponse, installH2SNetworkObserver};
     return;
   }
@@ -606,7 +686,14 @@
   const key = name => STORAGE_PREFIX + ':' + name;
   const get = (name, fallback) => GM_getValue(key(name), fallback);
   const set = (name, value) => GM_setValue(key(name), value);
-  const maxRent = () => parseBudget(get('maxRent', DEFAULT_MAX_RENT)) ?? DEFAULT_MAX_RENT;
+  const maxRent = () => settings.maxRent;
+  function currentConfigProblem() {
+    if (configStartupError) return configStartupError;
+    try {
+      const current = loadConfig(get('config', null), get('maxRent', null));
+      return JSON.stringify(current) === JSON.stringify(settings) ? '' : '配置已在其他标签页更改，请刷新当前页面';
+    } catch (error) { return error.message; }
+  }
   const readScanFailure = () => get('scanFailure', null) || {count: 0, retryAt: 0, paused: false};
   const telegramCooldownUntil = () => Math.max(0, Number(get('telegramCooldownUntil', 0)) || 0);
   function postponeTelegram(seconds = 60) {
@@ -629,6 +716,7 @@
   let daytime = withinHours();
   let maintenanceUntil = 0;
   let networkRefreshPending = false;
+  let settingsReloadPending = false;
   const stats = {message: '正在启动', phase: '未开始', sortStep: '', mode: '', scope: '', scanned: 0, matched: 0, occupied: 0, pages: 0, telegram: '未配置', sent: 0};
   const panelColors = {normal: '#e6edf5', muted: '#a6b8cb', info: '#7dd3fc', success: '#86efac', warning: '#fcd34d', error: '#fda4af'};
   const panelBackgrounds = {normal: '#162638', muted: '#162638', info: '#142d41', success: '#16332f', warning: '#352d20', error: '#38232e'};
@@ -668,7 +756,7 @@
     border: '1px solid #4bbbbb', borderRadius: '9px', background: 'linear-gradient(120deg, #116b70, #155b76)',
     color: '#f0fdfa', font: '600 13px/1.5 system-ui,sans-serif', cursor: 'pointer'});
   checkButton.addEventListener('click', safe(async () => { requireIdle(); await runScan(true); }));
-  const entryLink = panelNode('a', '打开五城市可订房源', {display: 'block', color: panelColors.info,
+  const entryLink = panelNode('a', '打开配置城市可订房源 / Open configured cities', {display: 'block', color: panelColors.info,
     textAlign: 'center', marginTop: '8px', fontSize: '12px'});
   entryLink.href = fiveCityUrl();
   panel.append(panelText, checkButton, entryLink);
@@ -676,7 +764,19 @@
   const readHistory = () => historyFrom(get('state', null));
   const targetsFor = filters => filters.allCities ? TARGET_CITIES : filters.cities;
   const scopeFor = filters => JSON.stringify(['price-asc-v1', selectionScope(filters), maxRent(),
+    ...(filters.allCities ? ['targets:' + JSON.stringify(cityKeys(TARGET_CITIES))] : []),
     ...(filters.availability ? ['availability:' + filters.availability] : [])]);
+  function scopeRequested(name, filters) {
+    const request = get(name, false);
+    if (request === true || request === scopeFor(filters)) return true;
+    // v1.3.14 global one-off requests did not include target cities in their scope.
+    // Honor them only for an untouched default installation, never imported settings.
+    if (!filters.allCities || get('config', null) != null ||
+        !sameCities(TARGET_CITIES, DEFAULT_CONFIG.cities.map(city => city.name))) return false;
+    const legacyScope = JSON.stringify(['price-asc-v1', '*', maxRent(),
+      ...(filters.availability ? ['availability:' + filters.availability] : [])]);
+    return request === legacyScope;
+  }
   const queuedItems = (history, filters) => Object.values(history.cities).flatMap(state => Object.values(state.items))
     .filter(item => item.pending && item.eligible && !item.missing && item.rent <= maxRent() && matchesCity(item.city, targetsFor(filters)));
   function sortingStatus(sorting, mode, filters) {
@@ -698,8 +798,7 @@
   }
   function notificationSummary(history, filters, previous, pending, sameScope) {
     if (!filters.ok) return '筛选条件通过并完成扫描后，才会生成房源通知。';
-    const scope = scopeFor(filters);
-    const requested = name => get(name, false) === true || get(name, false) === scope;
+    const requested = name => scopeRequested(name, filters);
     if (requested('notifyExisting')) return '已设置强制重发；下次完整扫描后发送符合房源。夜间请点立即检查。';
     if (requested('silentBaseline')) return '已设置静默基线；下次扫描记录现有房源，不发送这些房源。';
     if (!configured()) return 'Telegram 尚未配置；需要通知的房源会保留在待发队列。';
@@ -730,7 +829,7 @@
       : /暂停|重试/.test(phase) ? 'warning' : scanRunning || deliveryRunning ? 'info' : /完成/.test(phase) ? 'success' : 'muted';
     const header = panelNode('div', null, {display: 'flex', alignItems: 'center', justifyContent: 'space-between'});
     header.append(panelNode('strong', 'H2S', {fontSize: '21px', color: '#f0f9ff', letterSpacing: '0.5px'}),
-      panelNode('span', 'v1.3.14', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
+      panelNode('span', 'v1.4.0', {color: panelColors.info, background: '#1d354b', padding: '3px 9px', borderRadius: '20px', fontSize: '11px'}));
     const budget = panelNode('div', '预算内扫描 · 主租金 ≤ €' + maxRent(), {color: panelColors.info, margin: '3px 0 12px', fontSize: '12px'});
     const statusCard = panelNode('div', null, {background: panelBackgrounds[tone], borderLeft: '3px solid ' + panelColors[tone],
       borderRadius: '8px', padding: '9px 11px', marginBottom: '10px'});
@@ -743,9 +842,9 @@
     const occupied = sameScope ? stats.occupied : previous?.occupied || 0;
     if (occupied) counts.append(panelNode('div', '已跳过 ' + occupied + ' 套已租出房源（仍计入已读）', {color: panelColors.muted}));
     const details = panelNode('div');
-    details.append(panelRow('当前城市', filters.allCities ? '全部城市（本地筛选五城）' : filters.cities.join(', ') || '尚未识别'),
+    details.append(panelRow('当前城市', filters.allCities ? '全部城市（按配置筛选）' : filters.cities.join(', ') || '尚未识别'),
       panelRow('可订状态', filters.availability || '未筛选（仅通知可直接预订）'),
-      panelRow('目标城市', filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于目标五城' : '否 / 尚未确认', 'muted'),
+      panelRow('目标城市', filters.allCities ? '仅通知 ' + CITY_LABEL : filters.wanted ? '是，属于配置的目标城市' : '否 / 尚未确认', 'muted'),
       panelRow('筛选条件', filters.ok ? '通过' : '未通过；' + filters.reason, filters.ok ? 'success' : 'warning'),
       panelRow('价格排序', sortingStatus(sorting, mode, filters), sorting.ok || mode === 'single' ? 'success' : 'warning'));
     if (readScanFailure().count) details.append(panelRow('故障状态', readScanFailure().paused ? '已暂停；请手动恢复' : '连续失败 ' + readScanFailure().count + '/3', 'warning'));
@@ -770,8 +869,7 @@
       padding: '8px 0 4px', marginTop: '6px', borderTop: '1px solid #2b4055'});
     refresh.append(panelNode('span', '下次刷新 ', {color: panelColors.muted}), panelNode('strong',
       formatTime(filters.ok && lastScope === scopeFor(filters) ? nextRefresh : 0), {fontSize: '17px', color: panelColors.info}));
-    const hours = panelNode('div', '自动运行 ' + String(START_HOUR).padStart(2, '0') + ':00–' + String(END_HOUR).padStart(2, '0') +
-      ':00 荷兰时间', {color: panelColors.muted, fontSize: '11px'});
+    const hours = panelNode('div', '自动运行 ' + settings.activeHours.start + '–' + settings.activeHours.end + ' · ' + TIME_ZONE, {color: panelColors.muted, fontSize: '11px'});
     panelText.replaceChildren(header, budget, statusCard, counts, details, notification, footer, refresh, hours);
     checkButton.textContent = readScanFailure().paused ? '恢复并立即检查' : '立即检查（夜间也可运行）';
     const hold = readNetworkHold();
@@ -788,6 +886,9 @@
     return scopeFor(filterState(document));
   }
   function assertRunning(manual, sending = false) {
+    const configProblem = currentConfigProblem();
+    if (configProblem) throw cancelledError('配置已更改或无效，请刷新或重新导入 JSON：' + configProblem);
+    if (settingsReloadPending) throw cancelledError('配置已保存，请等待页面刷新');
     if (readNetworkHold() || networkRefreshPending) throw cancelledError('房源接口受阻，等待处理后重新加载');
     if (!isLeader || get('paused', false)) throw cancelledError('监控已暂停');
     if (readScanFailure().paused) throw cancelledError('连续扫描失败，监控已故障暂停');
@@ -897,6 +998,8 @@
     return task;
   }
   async function requestTelegram(method, payload) {
+    const configProblem = currentConfigProblem();
+    if (configProblem || settingsReloadPending) throw Error('配置已更改或无效，请刷新页面后重试 Telegram：' + configProblem);
     const remaining = telegramCooldownUntil() - Date.now();
     if (remaining > 0) {
       const error = Error('Telegram 等待重试，最早 ' + formatTime(telegramCooldownUntil()));
@@ -1193,7 +1296,7 @@
       else validateSweep(listings, total, selectedCities);
       assertAllowed(scope, manual, useCutoff);
       const history = readHistory();
-      const requested = name => get(name, false) === true || get(name, false) === scope;
+      const requested = name => scopeRequested(name, filters);
       const notifyExisting = requested('notifyExisting');
       const silentBaseline = requested('silentBaseline') && !notifyExisting;
       for (const city of targets) {
@@ -1238,6 +1341,9 @@
   }
   async function tick() {
     if (!isLeader || scanRunning || deliveryRunning) return;
+    const configProblem = currentConfigProblem();
+    if (configProblem) { nextRefresh = 0; deliveryContext = null; setStatus('配置已更改或无效，监控已暂停', '请刷新页面或通过菜单重新导入配置 JSON：' + configProblem); return; }
+    if (settingsReloadPending) { nextRefresh = 0; setStatus('配置已保存', '请等待页面刷新后使用新配置'); return; }
     if (get('paused', false)) { nextRefresh = 0; setStatus('手动暂停', '菜单可恢复'); return; }
     if (challenge(document)) { await notifyBlock(); return; }
     if (get('incident', null)) { set('incident', null); dirty = true; }
@@ -1282,7 +1388,36 @@
     return filters;
   }
   function register(label, callback) { GM_registerMenuCommand(label, safe(callback)); }
-  register('打开五城市可订房源', () => { requireIdle(); location.assign(fiveCityUrl()); });
+  register('打开配置城市可订房源 / Open configured cities', () => { requireIdle(); location.assign(fiveCityUrl()); });
+  register('导入配置 JSON / Import settings JSON', () => {
+    requireIdle();
+    const json = prompt('粘贴配置文件的完整 JSON 内容 / Paste the complete JSON from your config file.\n仅包含城市、预算、时间和刷新设置；不要粘贴 Telegram Token。');
+    if (json === null) return;
+    const incoming = parseConfig(json); // Validate everything before writing any value.
+    const history = readHistory();
+    history.scans = {}; // Old completed-scan summaries may describe another target set.
+    set('state', history);
+    set('config', incoming);
+    set('maxRent', incoming.maxRent); // Retain the legacy key for in-place downgrade compatibility.
+    set('notifyExisting', false);
+    set('silentBaseline', false);
+    deliveryContext = null;
+    lastScope = '';
+    nextRefresh = 0;
+    settingsReloadPending = true;
+    location.reload();
+  });
+  register('导出配置 JSON / Export settings JSON', () => {
+    const current = loadConfig(get('config', null), get('maxRent', null));
+    // Only validated public settings are exported; token/chatId/history never enter this object.
+    const json = JSON.stringify(current, null, 2) + '\n';
+    const download = document.createElement('a');
+    download.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(json);
+    download.download = 'h2s-config.json';
+    document.body.append(download);
+    download.click();
+    download.remove();
+  });
   register('配置 Telegram Token', () => {
     const value = prompt('粘贴 BotFather 提供的 Token（仅保存到 Tampermonkey，不写入代码）。留空取消。');
     if (!value) return;
@@ -1324,11 +1459,16 @@
   });
   register('设置预算（主租金上限）', () => {
     requireIdle();
+    const configProblem = currentConfigProblem();
+    if (configProblem || settingsReloadPending) throw Error('请先刷新页面或重新导入配置，再修改预算：' + configProblem);
     const value = prompt('输入每月主租金上限（欧元，不含额外费用；0 < 金额 ≤ 100000，最多两位小数）：', String(maxRent()));
     if (value === null) return;
     const budget = parseBudget(value);
     if (budget === null) throw Error('预算须大于 0、最高 100000 欧元，最多两位小数');
+    const updated = validateConfig({...settings, maxRent: budget});
+    set('config', updated);
     set('maxRent', budget);
+    settings = updated;
     deliveryContext = null;
     lastScope = '';
     nextRefresh = 0;

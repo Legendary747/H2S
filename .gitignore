@@ -9,3 +9,8 @@ browser-profile/
 storage-state*.json
 h2s.html
 h2s_files/
+
+# Local settings and generated reports (never commit Telegram credentials).
+config.local.json
+h2s-config.json
+browser-test-results.json

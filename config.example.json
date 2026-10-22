@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "cities": [
+    {
+      "name": "The Hague",
+      "id": "90"
+    },
+    {
+      "name": "Rijswijk",
+      "id": "6224"
+    },
+    {
+      "name": "Zoetermeer",
+      "id": "6088"
+    },
+    {
+      "name": "Rotterdam",
+      "id": "25"
+    },
+    {
+      "name": "Leiden",
+      "id": "6293"
+    }
+  ],
+  "maxRent": 1000,
+  "activeHours": {
+    "start": "07:00",
+    "end": "23:00",
+    "timeZone": "Europe/Amsterdam"
+  },
+  "refreshMinutes": [
+    5,
+    10
+  ]
+}
